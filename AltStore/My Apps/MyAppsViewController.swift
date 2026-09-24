@@ -67,6 +67,7 @@ class MyAppsViewController: UICollectionViewController
     private var minimuxerStatusCheckTask: Task<Void, Never>?
     private var commandTargetButton: UIBarButtonItem?
     private var commandTargetObservers: [NSObjectProtocol] = []
+    private var isImportingRemotePairingFile = false
     
     // Cache
     private var cachedUpdateSizes = [String: CGSize]()
@@ -347,6 +348,9 @@ private extension MyAppsViewController {
             NotificationCenter.default.addObserver(forName: .commandTargetDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
             },
+            NotificationCenter.default.addObserver(forName: .commandTargetsDidChange, object: nil, queue: .main) { [weak self] _ in
+                self?.rebuildCommandTargetMenu()
+            },
             NotificationCenter.default.addObserver(forName: .signingAccountDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
             }
@@ -391,6 +395,12 @@ private extension MyAppsViewController {
                 }
             }
 
+            let addAccount = UIAction(
+                title: NSLocalizedString("Add Apple ID…", comment: ""),
+                image: UIImage(systemName: "person.badge.plus"),
+                attributes: isBusy ? [.disabled] : []
+            ) { [weak self] _ in self?.addSigningAccount() }
+
             let connect = UIAction(
                 title: NSLocalizedString("Connect to StikServer…", comment: ""),
                 image: UIImage(systemName: "server.rack")
@@ -402,10 +412,20 @@ private extension MyAppsViewController {
                 CommandTargetManager.shared.startDiscovery()
                 self?.rebuildCommandTargetMenu()
             }
+            let pairNearby = UIAction(
+                title: NSLocalizedString("Pair Nearby Device…", comment: ""),
+                image: UIImage(systemName: "link.badge.plus"),
+                attributes: isBusy ? [.disabled] : []
+            ) { [weak self] _ in self?.presentWirelessPairing() }
+            let importPairing = UIAction(
+                title: NSLocalizedString("Import Device Pairing File…", comment: ""),
+                image: UIImage(systemName: "doc.badge.plus"),
+                attributes: isBusy ? [.disabled] : []
+            ) { [weak self] _ in self?.presentRemotePairingFilePicker() }
             self.commandTargetButton?.menu = UIMenu(children: [
                 UIMenu(title: NSLocalizedString("Install and Refresh On", comment: ""), options: .displayInline, children: targetActions),
-                UIMenu(title: NSLocalizedString("Signing Apple ID", comment: ""), options: .displayInline, children: accountActions),
-                UIMenu(options: .displayInline, children: [refresh, connect])
+                UIMenu(title: NSLocalizedString("Signing Apple ID", comment: ""), options: .displayInline, children: accountActions + [addAccount]),
+                UIMenu(options: .displayInline, children: [refresh, pairNearby, importPairing, connect])
             ])
             self.commandTargetButton?.accessibilityValue = "\(manager.selectedTarget.name), \(AuthManager.shared.currentAppleID ?? "No Apple ID")"
         }
@@ -438,6 +458,50 @@ private extension MyAppsViewController {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.rebuildCommandTargetMenu() }
         })
         present(alert, animated: true)
+    }
+
+    func presentWirelessPairing() {
+        let controller = UIHostingController(rootView: WirelessPairView())
+        controller.title = NSLocalizedString("Pair Nearby Device", comment: "")
+        navigationController?.pushViewController(controller, animated: true)
+    }
+
+    func presentRemotePairingFilePicker() {
+        isImportingRemotePairingFile = true
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: PairingFileManager.supportedContentTypes)
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        present(picker, animated: true)
+    }
+
+    func addSigningAccount() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let target = await CommandTargetManager.shared.snapshot()
+            do {
+                let result = try await AuthManager.shared.signIn(
+                    presentingViewController: self,
+                    skipResign: true,
+                    skipHowTos: true,
+                    commandTarget: target
+                )
+                let identifier = result.team.account?.identifier ?? result.team.identifier
+                AccountCredentialStore.shared.captureCurrentAccount(identifier: identifier)
+                activeTeam = result.team
+                collectionView.reloadData()
+                rebuildCommandTargetMenu()
+            } catch is CancellationError {
+                return
+            } catch {
+                let alert = UIAlertController(
+                    title: NSLocalizedString("Unable to Add Apple ID", comment: ""),
+                    message: error.localizedDescription,
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+                present(alert, animated: true)
+            }
+        }
     }
 }
 #endif
@@ -2929,12 +2993,38 @@ extension MyAppsViewController: UIDocumentPickerDelegate
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL])
     {
         guard let fileURL = urls.first else { return }
+
+        if isImportingRemotePairingFile {
+            isImportingRemotePairingFile = false
+            do {
+                try PairingFileManager.shared.importRemotePairingFile(from: fileURL)
+                CommandTargetManager.shared.startDiscovery()
+                let toast = ToastView(
+                    text: NSLocalizedString("Device Pairing File Added", comment: ""),
+                    detailText: NSLocalizedString("SideStore kept this device's main pairing identity unchanged.", comment: "")
+                )
+                toast.show(in: self.view)
+            } catch {
+                let alert = UIAlertController(
+                    title: NSLocalizedString("Unable to Add Device", comment: ""),
+                    message: error.localizedDescription,
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+                present(alert, animated: true)
+            }
+            return
+        }
         
         InstallAppDialog.present(ipaURL: fileURL, from: self) { [weak self] in
             self?.sideloadApp(at: fileURL) { (result) in
                 debugLog("Sideloaded app at \(fileURL) with result: \(result)")
             }
         }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        isImportingRemotePairingFile = false
     }
 }
 #endif

@@ -28,6 +28,7 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
     let skipCertificateProvisioning: Bool
     let skipResign: Bool
     let skipHowTos: Bool
+    let commandTarget: CommandTarget?
     let certificateFlow: CertificateProvisioningFlow
     let deviceRegistrationFlow: DeviceRegistrationFlow
 
@@ -38,7 +39,8 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
         skipDeviceRegistration: Bool = false,
         skipCertificateProvisioning: Bool = false,
         skipResign: Bool = false,
-        skipHowTos: Bool = false
+        skipHowTos: Bool = false,
+        commandTarget: CommandTarget? = nil
     ) throws {
         self.signInHandler = signInHandler
         self.anisetteServerHandler = anisetteServerHandler
@@ -46,6 +48,7 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
         self.skipCertificateProvisioning = skipCertificateProvisioning
         self.skipResign = skipResign
         self.skipHowTos = skipHowTos
+        self.commandTarget = commandTarget
         self.certificateFlow = CertificateProvisioningFlow(
             handler: signInHandler,
             skipCertificateProvisioning: skipCertificateProvisioning
@@ -193,9 +196,20 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
 
         // 2. Register Current Device
         if !self.skipDeviceRegistration {
-            self.verboseLog("[SignInOperation] Registering current device...")
-            if let device = try await self.deviceRegistrationFlow.registerCurrentDevice(for: team) {
-                self.debugLog("[SignInOperation] Registered current device UDID: \(device.identifier).")
+            self.verboseLog("[SignInOperation] Registering selected device...")
+            let registeredDeviceID: String?
+            if let commandTarget {
+                registeredDeviceID = try await DeviceOperationSession.run(target: commandTarget) {
+                    try await self.deviceRegistrationFlow.registerCurrentDevice(
+                        for: team,
+                        deviceName: commandTarget.name
+                    )?.identifier
+                }
+            } else {
+                registeredDeviceID = try await self.deviceRegistrationFlow.registerCurrentDevice(for: team)?.identifier
+            }
+            if let registeredDeviceID {
+                self.debugLog("[SignInOperation] Registered selected device UDID: \(registeredDeviceID).")
                 reportProgress(stepWeight * 3)
             } else {
                 self.debugLog("[SignInOperation] Device registration skipped by user.")

@@ -148,7 +148,8 @@ public final class AuthManager: @unchecked Sendable {
         skipDeviceRegistration: Bool = false,
         skipCertificateProvisioning: Bool = false,
         skipResign: Bool = false,
-        skipHowTos: Bool = false
+        skipHowTos: Bool = false,
+        commandTarget: CommandTarget? = nil
     ) async throws -> SignInResult {
         await AccountCredentialStore.shared.captureActiveAccount()
         let dbBackgroundContext = DatabaseManager.shared.persistentContainer.newBackgroundContext()
@@ -165,7 +166,8 @@ public final class AuthManager: @unchecked Sendable {
             skipDeviceRegistration: skipDeviceRegistration,
             skipCertificateProvisioning: skipCertificateProvisioning,
             skipResign: skipResign,
-            skipHowTos: skipHowTos
+            skipHowTos: skipHowTos,
+            commandTarget: commandTarget
         )
         let result = try await signInOperation.execute()
         self.team = result.team

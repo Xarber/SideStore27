@@ -49,6 +49,7 @@ struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
 
 extension Notification.Name {
     static let commandTargetDidChange = Notification.Name("SideStore.commandTargetDidChange")
+    static let commandTargetsDidChange = Notification.Name("SideStore.commandTargetsDidChange")
     static let signingAccountDidChange = Notification.Name("SideStore.signingAccountDidChange")
 }
 
@@ -151,6 +152,7 @@ final class CommandTargetManager: ObservableObject {
                 if !self.nearbyTargets.contains(where: { $0.id == target.id }) {
                     self.nearbyTargets.append(target)
                     self.nearbyTargets.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
                 }
             }
         }
@@ -169,6 +171,7 @@ final class CommandTargetManager: ObservableObject {
                 relayCapabilities: Set(device.capabilities ?? [])
             )
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
     }
 
     private static func resolve(_ service: DiscoveredService) async -> (host: String, port: UInt16)? {
@@ -210,6 +213,28 @@ struct RemotePairingFile: Sendable {
 }
 
 extension PairingFileManager {
+    @discardableResult
+    func importRemotePairingFile(from sourceURL: URL) throws -> RemotePairingFile {
+        let (content, parsed) = try inspectPairingFile(from: sourceURL)
+        let identifier: String
+        if let remote = parsed as? RPPairingFile {
+            identifier = remote.identifier
+        } else if let lockdown = parsed as? LockdownPairingFile {
+            identifier = lockdown.udid
+        } else {
+            throw RemoteDeviceError.missingPairingFile
+        }
+
+        let sanitized = identifier.unicodeScalars
+            .filter { CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }
+            .map(String.init)
+            .joined()
+        let fileName = "SideStoreRemote_\(sanitized.isEmpty ? UUID().uuidString : sanitized)_rp.plist"
+        let destinationURL = FileManager.default.documentsDirectory.appendingPathComponent(fileName)
+        try content.write(to: destinationURL, atomically: true, encoding: .utf8)
+        return RemotePairingFile(url: destinationURL, identifier: identifier)
+    }
+
     nonisolated func remotePairingFiles() -> [RemotePairingFile] {
         let directory = FileManager.default.documentsDirectory
         let localPaths = Set([

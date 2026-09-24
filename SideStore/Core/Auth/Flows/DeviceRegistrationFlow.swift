@@ -23,10 +23,10 @@ final class DeviceRegistrationFlow: @unchecked Sendable {
     }
 
     @discardableResult
-    func registerCurrentDevice(for team: ALTTeam) async throws -> ALTDevice? {
+    func registerCurrentDevice(for team: ALTTeam, deviceName: String? = nil) async throws -> ALTDevice? {
         while true {
             do {
-                return try await self.performDeviceRegistration(for: team)
+                return try await self.performDeviceRegistration(for: team, deviceName: deviceName)
             } catch {
                 if let handler = self.handler {
                     let decision = await handler.resolveDeviceRegistrationErrors(error)
@@ -66,7 +66,7 @@ final class DeviceRegistrationFlow: @unchecked Sendable {
         }
     }
 
-    private func performDeviceRegistration(for team: ALTTeam) async throws -> ALTDevice {
+    private func performDeviceRegistration(for team: ALTTeam, deviceName: String?) async throws -> ALTDevice {
         debugLog("[DeviceRegistrationFlow] performDeviceRegistration starting...")
         let udid = try await self.fetchDeviceUDID()
         debugLog("[DeviceRegistrationFlow] Fetched device UDID: \(udid). Fetching team devices...")
@@ -77,9 +77,14 @@ final class DeviceRegistrationFlow: @unchecked Sendable {
             UserDefaults.standard.isDeviceRegistered = true
             return device
         } else {
-            let deviceName = await MainActor.run { UIDevice.current.name }
-            debugLog("[DeviceRegistrationFlow] Registering new device '\(deviceName)' (UDID: \(udid))...")
-            let device = try await DeveloperPortalProxy.shared.registerDevice(name: deviceName, identifier: udid, type: DeveloperPortalProxy.currentDeviceType, team: team)
+            let resolvedDeviceName: String
+            if let deviceName {
+                resolvedDeviceName = deviceName
+            } else {
+                resolvedDeviceName = await MainActor.run { UIDevice.current.name }
+            }
+            debugLog("[DeviceRegistrationFlow] Registering new device '\(resolvedDeviceName)' (UDID: \(udid))...")
+            let device = try await DeveloperPortalProxy.shared.registerDevice(name: resolvedDeviceName, identifier: udid, type: DeveloperPortalProxy.currentDeviceType, team: team)
             debugLog("[DeviceRegistrationFlow] Device '\(device.name)' (UDID: \(udid)) successfully registered.")
             UserDefaults.standard.isDeviceRegistered = true
             return device
