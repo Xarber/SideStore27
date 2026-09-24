@@ -131,10 +131,12 @@ final class CommandTargetManager: ObservableObject {
                 let txt = Dictionary(uniqueKeysWithValues: service.txtRecords.map { ($0.key.lowercased(), $0.value) })
                 let identifiers = [txt["identifier"], txt["uuid"], txt["deviceid"], txt["udid"]]
                     .compactMap { $0?.lowercased() }
-                let normalizedName = service.name.lowercased().filter(\.isLetterOrNumber)
+                let normalizedName = service.name.lowercased().filter { $0.isLetter || $0.isNumber }
                 let pairing = identifiers.compactMap({ knownIdentifiers[$0] }).first
                     ?? pairings.first(where: {
-                        $0.url.deletingPathExtension().lastPathComponent.lowercased().filter(\.isLetterOrNumber).contains(normalizedName)
+                        $0.url.deletingPathExtension().lastPathComponent.lowercased()
+                            .filter { $0.isLetter || $0.isNumber }
+                            .contains(normalizedName)
                     })?.url
                 guard let pairing else { return }
                 let id = identifiers.first ?? service.id
@@ -402,18 +404,18 @@ final class StikServerDeviceConnection: ObservableObject {
     }
 
     func beginOperation(target: CommandTarget) async throws {
-        _ = try await request("sideStoreBegin", target: target, fields: [:], timeout: .seconds(20))
+        _ = try await request("sideStoreBegin", target: target, fields: [:], timeout: 20)
     }
 
     func endOperation(target: CommandTarget) async {
-        _ = try? await request("sideStoreEnd", target: target, fields: [:], timeout: .seconds(10))
+        _ = try? await request("sideStoreEnd", target: target, fields: [:], timeout: 10)
     }
 
     func request(
         _ command: String,
         target: CommandTarget,
         fields: [String: Any],
-        timeout: Duration = .seconds(60)
+        timeout: TimeInterval = 60
     ) async throws -> [String: Any] {
         guard let socket, let deviceID = target.relayDeviceID else { throw RemoteDeviceError.relayDisconnected }
         let requestID = UUID().uuidString
@@ -431,7 +433,7 @@ final class StikServerDeviceConnection: ObservableObject {
             Task {
                 do {
                     try await socket.send(.string(text))
-                    try await Task.sleep(for: timeout)
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                     guard let continuation = self.pending.removeValue(forKey: requestID) else { return }
                     continuation.resume(throwing: StikServerRequestError.timedOut)
                 } catch {
@@ -493,7 +495,7 @@ enum RemoteDeviceOperations {
         let target = DeviceOperationScope.target
         if target.kind == .stikServer {
             _ = try await StikServerDeviceConnection.shared.request(
-                "sideStoreReady", target: target, fields: [:], timeout: .seconds(20)
+                "sideStoreReady", target: target, fields: [:], timeout: 20
             )
         } else if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) {
             throw error.asOperationError
@@ -552,7 +554,7 @@ enum RemoteDeviceOperations {
                     "offset": offset,
                     "data": chunk.base64EncodedString()
                 ],
-                timeout: .seconds(60)
+                timeout: 60
             )
             offset = end
         }
@@ -560,12 +562,12 @@ enum RemoteDeviceOperations {
             "sideStoreUploadCommit",
             target: target,
             fields: ["uploadId": uploadID],
-            timeout: .seconds(15 * 60)
+            timeout: 15 * 60
         )
     }
 
     static func installIPA(bundleID: String) async throws {
-        try await command("sideStoreInstallIPA", fields: ["bundleId": bundleID], timeout: .seconds(15 * 60)) {
+        try await command("sideStoreInstallIPA", fields: ["bundleId": bundleID], timeout: 15 * 60) {
             try await minimuxer.core.installIpa(bundleId: bundleID)
         }
     }
@@ -579,7 +581,7 @@ enum RemoteDeviceOperations {
             "sideStoreDumpProfiles",
             target: target,
             fields: ["mode": { if case .zip = mode { return "zip" }; return "raw" }()],
-            timeout: .seconds(120)
+            timeout: 120
         )
         guard let encoded = response["data"] as? String,
               let data = Data(base64Encoded: encoded),
@@ -603,7 +605,7 @@ enum RemoteDeviceOperations {
     private static func command(
         _ name: String,
         fields: [String: Any],
-        timeout: Duration = .seconds(60),
+        timeout: TimeInterval = 60,
         local: () async throws -> Void
     ) async throws {
         let target = DeviceOperationScope.target
