@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 import argparse
 import sys
+import os
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -141,6 +142,8 @@ def main():
 
     localized_description = getFormattedLocalizedDescription(args.marketing_version, args.short_commit, human, notes)
 
+    repository = os.environ.get("GITHUB_REPOSITORY", "Xarber/SideStore27")
+
     metadata = {
         "is_beta": bool(args.is_beta),
         "bundle_identifier": args.bundle_id,
@@ -150,7 +153,7 @@ def main():
         "size": file_size(ipa_path),
         "sha256": sha256(ipa_path),
         "download_url": (
-            "https://github.com/SideStore/SideStore/releases/download/"
+            f"https://github.com/{repository}/releases/download/"
             f"{args.release_tag}/SideStore.ipa"
         ),
         "localized_description": localized_description,

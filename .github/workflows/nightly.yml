@@ -20,7 +20,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-26
+    name: Build using Xcode 27
+    runs-on: xcode-27
     env:
       DEPLOY_KEY: ${{ secrets.CROSS_REPO_PUSH_KEY }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -29,7 +30,7 @@ jobs:
       UPSTREAM_CHANNEL: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
@@ -83,11 +84,12 @@ jobs:
           echo "SHORT_COMMIT=$SHORT_COMMIT" | tee -a $GITHUB_ENV
           echo "MARKETING_VERSION=$NORMALIZED_VERSION" | tee -a $GITHUB_ENV
 
-      - name: Setup Xcode
+      - name: Show Xcode version
         if: steps.build_gate.outputs.should_skip != 'true'
-        uses: maxim-lobanov/setup-xcode@v1.6.0
-        with:
-          xcode-version: "26.4"
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Restore Cache (exact)
         if: steps.build_gate.outputs.should_skip != 'true'
@@ -216,7 +218,7 @@ jobs:
           name: SideStore-${{ env.MARKETING_VERSION }}-dSYMs.zip
           path: SideStore.dSYMs.zip
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.build_gate.outputs.should_skip != 'true' && env.DEPLOY_KEY != ''
         with:
           repository: "SideStore/apps-v2.json"
