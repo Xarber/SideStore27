@@ -174,6 +174,10 @@ public final class CellularRefreshManager: @unchecked Sendable {
     // public apis
     @discardableResult
     public func turnOffDataIfNeeded(addOnDelay: TimeInterval = 0) async -> Bool {
+        guard DeviceOperationScope.target.kind == .local else {
+            debugLog("[CellularRefreshManager] Remote command target selected; preserving this device's network connection.")
+            return false
+        }
         guard isSupported && isEnabled else { return false }
         guard !didTurnOffData else { return false }
 

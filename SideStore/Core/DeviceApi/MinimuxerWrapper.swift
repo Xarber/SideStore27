@@ -206,8 +206,8 @@ public func isMinimuxerReady() async -> Result<Bool, MinimuxerError> {
 }
 
 public func ensureMinimuxerReady() async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await ensureMinimuxerReady() }
     }
     if DeviceOperationScope.target.kind != .local {
@@ -283,8 +283,8 @@ func minimuxerStop() async throws {
 }
 
 func installProvisioningProfiles(_ profileData: Data) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await installProvisioningProfiles(profileData) }
     }
     defer { debugLog("[SideStore] installProvisioningProfiles(profileData) completed") }
@@ -297,8 +297,8 @@ func installProvisioningProfiles(_ profileData: Data) async throws {
 }
 
 func removeProvisioningProfile(_ id: String) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await removeProvisioningProfile(id) }
     }
     defer { debugLog("[SideStore] removeProvisioningProfile(id) completed") }
@@ -311,8 +311,8 @@ func removeProvisioningProfile(_ id: String) async throws {
 }
 
 func removeApp(_ bundleId: String) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await removeApp(bundleId) }
     }
     defer { debugLog("[SideStore] removeApp(bundleId) completed") }
@@ -324,23 +324,35 @@ func removeApp(_ bundleId: String) async throws {
     #endif
 }
 
-func sendIpaAfc(_ bundleId: String, _ rawBytes: Data) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
-        return try await DeviceOperationSession.run(target: target) { try await sendIpaAfc(bundleId, rawBytes) }
+func sendIpaAfc(
+    _ bundleId: String,
+    _ rawBytes: Data,
+    progressHandler: (@Sendable (Double) -> Void)? = nil
+) async throws {
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
+        return try await DeviceOperationSession.run(target: target) {
+            try await sendIpaAfc(bundleId, rawBytes, progressHandler: progressHandler)
+        }
     }
     defer { debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) is no-op on simulator")
     #else
     debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) invoked")
-    try await withRemotePairingRetry { try await RemoteDeviceOperations.sendIPA(bundleID: bundleId, data: rawBytes) }
+    try await withRemotePairingRetry {
+        try await RemoteDeviceOperations.sendIPA(
+            bundleID: bundleId,
+            data: rawBytes,
+            progressHandler: progressHandler
+        )
+    }
     #endif
 }
 
 func sendAppBundleAfc(_ bundleId: String, at appURL: URL) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await sendAppBundleAfc(bundleId, at: appURL) }
     }
     defer { debugLog("[SideStore] sendAppBundleAfc(bundleId, appURL) completed") }
@@ -356,8 +368,8 @@ func sendAppBundleAfc(_ bundleId: String, at appURL: URL) async throws {
 }
 
 func installIPA(_ bundleId: String) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await installIPA(bundleId) }
     }
     defer { debugLog("[SideStore] installIPA(bundleId) completed") }
@@ -370,8 +382,8 @@ func installIPA(_ bundleId: String) async throws {
 }
 
 func installAppBundle(_ bundleId: String, appName: String) async throws {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await installAppBundle(bundleId, appName: appName) }
     }
     defer { debugLog("[SideStore] installAppBundle(bundleId, appName) completed") }
@@ -388,8 +400,8 @@ func installAppBundle(_ bundleId: String, appName: String) async throws {
 
 @discardableResult
 func fetchUDID(forceLive: Bool = false) async throws -> String {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await fetchUDID(forceLive: forceLive) }
     }
     defer { debugLog("[SideStore] fetchUDID() completed") }
@@ -416,6 +428,12 @@ func fetchUDID(forceLive: Bool = false) async throws -> String {
 
 @discardableResult
 func safeFetchUDID(forceLive: Bool = false) async throws -> String {
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
+        return try await DeviceOperationSession.run(target: target) {
+            try await safeFetchUDID(forceLive: forceLive)
+        }
+    }
     try await ensureMinimuxerReady()
     return try await fetchUDID(forceLive: forceLive)
 }
@@ -455,8 +473,8 @@ func safeAttachDebugger(_ pid: UInt32) async throws {
 }
 
 func dumpProfiles(_ docsPath: String, mode: ProfileDumpMode = .zip) async throws -> String {
-    if DeviceOperationScope.scopedTarget == nil {
-        let target = await CommandTargetManager.shared.snapshot()
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
         return try await DeviceOperationSession.run(target: target) { try await dumpProfiles(docsPath, mode: mode) }
     }
     defer { debugLog("[SideStore] dumpProfiles(docsPath) completed") }
@@ -472,6 +490,12 @@ func dumpProfiles(_ docsPath: String, mode: ProfileDumpMode = .zip) async throws
 }
 
 func safeDumpProfiles(_ docsPath: String, mode: ProfileDumpMode = .zip) async throws -> String {
+    if !DeviceOperationScope.isSessionActive {
+        let target = await DeviceOperationScope.resolvedTarget()
+        return try await DeviceOperationSession.run(target: target) {
+            try await safeDumpProfiles(docsPath, mode: mode)
+        }
+    }
     try await ensureMinimuxerReady()
     return try await dumpProfiles(docsPath, mode: mode)
 }

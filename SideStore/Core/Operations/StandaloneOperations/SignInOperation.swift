@@ -202,7 +202,8 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
                 registeredDeviceID = try await DeviceOperationSession.run(target: commandTarget) {
                     try await self.deviceRegistrationFlow.registerCurrentDevice(
                         for: team,
-                        deviceName: commandTarget.name
+                        deviceName: commandTarget.name,
+                        deviceType: commandTarget.developerPortalDeviceType
                     )?.identifier
                 }
             } else {

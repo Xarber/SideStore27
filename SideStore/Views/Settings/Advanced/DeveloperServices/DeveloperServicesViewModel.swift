@@ -174,7 +174,11 @@ class DeveloperServicesViewModel: ObservableObject {
             if let type = type {
                 _ = try await DeveloperPortalProxy.shared.downloadProvisioningProfile(for: appID, type: type)
             } else {
-                _ = try await DeveloperPortalProxy.shared.downloadProvisioningProfile(for: appID, deviceType: DeveloperPortalProxy.currentDeviceType)
+                let target = await CommandTargetManager.shared.snapshot()
+                _ = try await DeveloperPortalProxy.shared.downloadProvisioningProfile(
+                    for: appID,
+                    deviceType: target.developerPortalDeviceType
+                )
             }
             await self.fetchProfiles(presentingViewController: presentingViewController)
             self.showToastMessage("Profile generated for '\(appID.name)'")

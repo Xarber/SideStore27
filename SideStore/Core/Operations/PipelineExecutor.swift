@@ -30,7 +30,37 @@ final class PipelineExecutor: @unchecked Sendable {
     ) async throws -> InstalledApp {
         var finalApp: InstalledApp?
         
-        for pipelineStep in pipelineSteps {
+        var index = 0
+        while index < pipelineSteps.count {
+            let pipelineStep = pipelineSteps[index]
+            if pipelineStep.step == .sendApp,
+               index + 1 < pipelineSteps.count,
+               pipelineSteps[index + 1].step == .installApp {
+                let target = DeviceOperationScope.target
+                try await DeviceOperationSession.run(target: target) {
+                    _ = try await self.executeStep(
+                        .sendApp,
+                        context: context,
+                        appOperation: operation,
+                        group: group,
+                        downloadingApp: downloadingApp,
+                        permissionsMode: permissionsMode,
+                        progress: operationProgress
+                    )
+                    _ = try await self.executeStep(
+                        .installApp,
+                        context: context,
+                        appOperation: operation,
+                        group: group,
+                        downloadingApp: downloadingApp,
+                        permissionsMode: permissionsMode,
+                        progress: operationProgress
+                    )
+                }
+                finalApp = context.installedApp
+                index += 2
+                continue
+            }
             if let result = try await executeStep(
                 pipelineStep.step,
                 context: context,
@@ -42,6 +72,7 @@ final class PipelineExecutor: @unchecked Sendable {
             ) {
                 finalApp = result
             }
+            index += 1
         }
         
         guard let resultApp = finalApp ?? context.installedApp ?? (operation.app as? InstalledApp) else {

@@ -68,6 +68,7 @@ class MyAppsViewController: UICollectionViewController
     private var commandTargetButton: UIBarButtonItem?
     private var commandTargetObservers: [NSObjectProtocol] = []
     private var isImportingRemotePairingFile = false
+    private var isManagingSigningAccounts = false
     
     // Cache
     private var cachedUpdateSizes = [String: CGSize]()
@@ -351,6 +352,16 @@ private extension MyAppsViewController {
             NotificationCenter.default.addObserver(forName: .commandTargetsDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
             },
+            NotificationCenter.default.addObserver(forName: .commandTargetConnectionFailed, object: nil, queue: .main) { [weak self] notification in
+                guard let self, let error = notification.object as? Error, self.viewIfLoaded?.window != nil else { return }
+                let alert = UIAlertController(
+                    title: NSLocalizedString("StikServer Disconnected", comment: ""),
+                    message: error.localizedDescription,
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+                self.present(alert, animated: true)
+            },
             NotificationCenter.default.addObserver(forName: .signingAccountDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
             }
@@ -362,16 +373,28 @@ private extension MyAppsViewController {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let manager = CommandTargetManager.shared
-            let isBusy = AppManager.shared.isActivelyManagingAnyApp
-            let targets = [CommandTarget.local] + manager.nearbyTargets + manager.relayTargets
+            let isBusy = AppManager.shared.isActivelyManagingAnyApp || isManagingSigningAccounts
+            var targets = [CommandTarget.local] + manager.nearbyTargets + manager.relayTargets
+            if !targets.contains(where: { $0.id == manager.selectedTarget.id }) {
+                targets.append(manager.selectedTarget)
+            }
+            let availableTargetIDs = Set(([CommandTarget.local] + manager.nearbyTargets + manager.relayTargets).map(\.id))
             let targetActions = targets.map { target in
-                UIAction(
+                let subtitle: String?
+                let isUnavailable = !availableTargetIDs.contains(target.id)
+                let isUnsupportedRelay = target.kind == .stikServer && !target.supportsSideStoreOperations
+                if isUnavailable {
+                    subtitle = NSLocalizedString("Unavailable — refresh devices or reconnect", comment: "")
+                } else if isUnsupportedRelay {
+                    subtitle = NSLocalizedString("Relay does not support SideStore operations", comment: "")
+                } else {
+                    subtitle = nil
+                }
+                return UIAction(
                     title: target.name,
-                    subtitle: target.kind == .stikServer && !target.supportsSideStoreOperations
-                        ? NSLocalizedString("Relay does not support SideStore operations", comment: "")
-                        : nil,
+                    subtitle: subtitle,
                     image: UIImage(systemName: target.kind == .local ? "iphone" : target.kind == .nearby ? "iphone.radiowaves.left.and.right" : "network"),
-                    attributes: isBusy ? [.disabled] : [],
+                    attributes: isBusy || isUnavailable || isUnsupportedRelay ? [.disabled] : [],
                     state: manager.selectedTarget.id == target.id ? .on : .off
                 ) { _ in manager.select(target) }
             }
@@ -403,11 +426,13 @@ private extension MyAppsViewController {
 
             let connect = UIAction(
                 title: NSLocalizedString("Connect to StikServer…", comment: ""),
-                image: UIImage(systemName: "server.rack")
+                image: UIImage(systemName: "server.rack"),
+                attributes: isBusy ? [.disabled] : []
             ) { [weak self] _ in self?.presentStikServerConnection() }
             let refresh = UIAction(
                 title: NSLocalizedString("Refresh Devices", comment: ""),
-                image: UIImage(systemName: "arrow.clockwise")
+                image: UIImage(systemName: "arrow.clockwise"),
+                attributes: isBusy ? [.disabled] : []
             ) { [weak self] _ in
                 CommandTargetManager.shared.startDiscovery()
                 self?.rebuildCommandTargetMenu()
@@ -461,7 +486,7 @@ private extension MyAppsViewController {
     }
 
     func presentWirelessPairing() {
-        let controller = UIHostingController(rootView: WirelessPairView())
+        let controller = UIHostingController(rootView: WirelessPairView(automaticallyPresentClient: true))
         controller.title = NSLocalizedString("Pair Nearby Device", comment: "")
         navigationController?.pushViewController(controller, animated: true)
     }
@@ -477,7 +502,17 @@ private extension MyAppsViewController {
     func addSigningAccount() {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard !isManagingSigningAccounts else { return }
+            isManagingSigningAccounts = true
+            rebuildCommandTargetMenu()
+            defer {
+                isManagingSigningAccounts = false
+                rebuildCommandTargetMenu()
+            }
             let target = await CommandTargetManager.shared.snapshot()
+            await AccountCredentialStore.shared.captureActiveAccount()
+            let previousAccountID = await AccountCredentialStore.shared.availableAccounts()
+                .first(where: { $0.isActive })?.identifier
             do {
                 let result = try await AuthManager.shared.signIn(
                     presentingViewController: self,
@@ -491,8 +526,17 @@ private extension MyAppsViewController {
                 collectionView.reloadData()
                 rebuildCommandTargetMenu()
             } catch is CancellationError {
+                if let previousAccountID {
+                    try? await AccountCredentialStore.shared.activate(identifier: previousAccountID)
+                }
                 return
             } catch {
+                if let previousAccountID {
+                    try? await AccountCredentialStore.shared.activate(identifier: previousAccountID)
+                }
+                if let operationError = error as? OperationError, case .cancelled = operationError {
+                    return
+                }
                 let alert = UIAlertController(
                     title: NSLocalizedString("Unable to Add Apple ID", comment: ""),
                     message: error.localizedDescription,

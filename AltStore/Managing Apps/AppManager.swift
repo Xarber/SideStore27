@@ -661,7 +661,9 @@ final class AppManager: ObservableObject, @unchecked Sendable
             do {
                 let enableJITOperation = try EnableJITOperation(installedApp: installedApp, context: context)
                 do {
-                    _ = try await enableJITOperation.execute()
+                    _ = try await DeviceOperationSession.run(target: .local) {
+                        try await enableJITOperation.execute()
+                    }
                     completionHandler(.success(()))
                 } catch {
                     var appName: String = ""
@@ -893,5 +895,4 @@ extension AppManager: PipelineProgress, PipelineExecutionContext, PipelineErrorL
     }
 
 }
-
 

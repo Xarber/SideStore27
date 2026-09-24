@@ -54,7 +54,9 @@ final class DeactivateAppOperation: BasePipelineOperation<PipelineOperationConte
         let appExIdentifiers = installedApp.appExtensions.map { $0.resignedBundleIdentifier }
         let allIdentifiers = [installedApp.resignedBundleIdentifier] + appExIdentifiers
 
-        var removedAny = false
+        guard !allIdentifiers.isEmpty else {
+            throw OperationError.invalidParameters("DeactivateAppOperation: no profiles found to remove")
+        }
         let count = allIdentifiers.count
         let startProgress = self.progress.completedUnitCount
         let endProgress: Int64 = 90
@@ -62,24 +64,22 @@ final class DeactivateAppOperation: BasePipelineOperation<PipelineOperationConte
         
         do {
             await CellularRefreshManager.shared.turnOffDataIfNeeded()
-            for (index, identifier) in allIdentifiers.enumerated() {
-                try await removeProvisioningProfile(identifier)
-                if range > 0 {
-                    let percent = startProgress + Int64(Double(index + 1) / Double(count) * Double(range))
-                    self.setProgress(percent)
+            let target = DeviceOperationScope.target
+            try await DeviceOperationSession.run(target: target) {
+                for (index, identifier) in allIdentifiers.enumerated() {
+                    try await removeProvisioningProfile(identifier)
+                    if range > 0 {
+                        let percent = startProgress + Int64(Double(index + 1) / Double(count) * Double(range))
+                        self.setProgress(percent)
+                    }
                 }
-                removedAny = true
             }
             await CellularRefreshManager.shared.turnOnDataIfNeeded()
         } catch {
             await CellularRefreshManager.shared.turnOnDataIfNeeded()
             throw error
         }
-        guard removedAny else {
-            throw OperationError.invalidParameters("DeactivateAppOperation: no profiles found to remove")
-        }
         installedApp.isActive = false
         return installedApp
     }
 }
-

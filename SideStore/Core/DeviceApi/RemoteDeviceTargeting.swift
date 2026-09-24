@@ -12,6 +12,7 @@ import Foundation
 import Minimuxer
 import MinimuxerCommon
 import Network
+import SideSign
 import UIKit
 
 enum CommandTargetKind: String, Codable, Sendable {
@@ -24,6 +25,9 @@ struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String
     let kind: CommandTargetKind
+    var deviceKind: String? = nil
+    var pairingIdentifier: String? = nil
+    var discoveryServiceID: String? = nil
     var host: String?
     var port: UInt16?
     var pairingFilePath: String?
@@ -35,7 +39,8 @@ struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
     static let local = CommandTarget(
         id: "local",
         name: String(format: NSLocalizedString("This %@", comment: "Local command target"), UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"),
-        kind: .local
+        kind: .local,
+        deviceKind: UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
     )
 
     var pairingFileURL: URL? {
@@ -45,11 +50,21 @@ struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
     var supportsSideStoreOperations: Bool {
         kind != .stikServer || relayCapabilities.contains("sidestore.device.v1") || relayDeviceID?.hasPrefix("sidestore-agent|") == true
     }
+
+    var developerPortalDeviceType: ALTDeviceType {
+        let value = (deviceKind ?? name).lowercased()
+        if value.contains("ipad") { return .ipad }
+        if value.contains("appletv") || value.contains("apple tv") || value.contains("tvos") { return .tv }
+        if value.contains("watch") { return .watch }
+        if value.contains("vision") { return .vision }
+        return .iphone
+    }
 }
 
 extension Notification.Name {
     static let commandTargetDidChange = Notification.Name("SideStore.commandTargetDidChange")
     static let commandTargetsDidChange = Notification.Name("SideStore.commandTargetsDidChange")
+    static let commandTargetConnectionFailed = Notification.Name("SideStore.commandTargetConnectionFailed")
     static let signingAccountDidChange = Notification.Name("SideStore.signingAccountDidChange")
 }
 
@@ -67,12 +82,10 @@ final class CommandTargetManager: ObservableObject {
     private var resolutionTasks: [String: Task<Void, Never>] = [:]
 
     private init() {
-        if let data = UserDefaults.standard.data(forKey: selectedTargetKey),
-           let stored = try? JSONDecoder().decode(CommandTarget.self, from: data) {
-            selectedTarget = stored
-        } else {
-            selectedTarget = .local
-        }
+        // A relaunch always returns to the safe, ordinary SideStore workflow.
+        // Remote choices remain explicit for each app session.
+        selectedTarget = .local
+        UserDefaults.standard.removeObject(forKey: selectedTargetKey)
 
         BonjourDiscoveryManager.shared.$instances
             .receive(on: RunLoop.main)
@@ -120,9 +133,25 @@ final class CommandTargetManager: ObservableObject {
 
     private func updateNearbyTargets(from services: [DiscoveredService]) {
         let pairings = PairingFileManager.shared.remotePairingFiles()
-        let knownIdentifiers = Dictionary(uniqueKeysWithValues: pairings.compactMap { item in
-            item.identifier.map { ($0.lowercased(), item.url) }
-        })
+        var knownIdentifiers: [String: URL] = [:]
+        for pairing in pairings {
+            if let identifier = pairing.identifier?.lowercased(), knownIdentifiers[identifier] == nil {
+                knownIdentifiers[identifier] = pairing.url
+            }
+        }
+        let visibleServiceIDs = Set(services.map(\.id))
+        for serviceID in Array(resolutionTasks.keys) where !visibleServiceIDs.contains(serviceID) {
+            resolutionTasks.removeValue(forKey: serviceID)?.cancel()
+        }
+        let previousCount = nearbyTargets.count
+        nearbyTargets.removeAll { target in
+            guard let serviceID = target.discoveryServiceID else { return false }
+            return !visibleServiceIDs.contains(serviceID)
+        }
+        if nearbyTargets.count != previousCount {
+            NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
+            updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+        }
 
         for service in services where resolutionTasks[service.id] == nil {
             resolutionTasks[service.id] = Task { [weak self] in
@@ -145,14 +174,26 @@ final class CommandTargetManager: ObservableObject {
                     id: "nearby|\(id)",
                     name: service.name,
                     kind: .nearby,
+                    deviceKind: txt["model"] ?? txt["deviceclass"] ?? txt["kind"],
+                    pairingIdentifier: identifiers.first,
+                    discoveryServiceID: service.id,
                     host: resolved.host,
                     port: resolved.port,
                     pairingFilePath: pairing.path
                 )
-                if !self.nearbyTargets.contains(where: { $0.id == target.id }) {
+                if let index = self.nearbyTargets.firstIndex(where: { $0.id == target.id }) {
+                    guard self.nearbyTargets[index] != target else { return }
+                    self.nearbyTargets[index] = target
+                    if self.selectedTarget.id == target.id {
+                        self.select(target)
+                    }
+                    NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
+                    self.updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+                } else {
                     self.nearbyTargets.append(target)
                     self.nearbyTargets.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
                     NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
+                    self.updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
                 }
             }
         }
@@ -160,17 +201,35 @@ final class CommandTargetManager: ObservableObject {
 
     private func updateRelayTargets(from devices: [StikServerDevice]) {
         let connection = StikServerDeviceConnection.shared
-        relayTargets = devices.map { device in
+        let directIdentifiers = Set(nearbyTargets.compactMap { $0.pairingIdentifier?.lowercased() })
+        var bestRoutes: [String: StikServerDevice] = [:]
+        for device in devices where device.connected != false {
+            let supportsSideStore = device.id.hasPrefix("sidestore-agent|")
+                || (device.capabilities ?? []).contains("sidestore.device.v1")
+            guard supportsSideStore else { continue }
+            let routeKey = device.pairingIdentifier?.lowercased() ?? device.id
+            guard !directIdentifiers.contains(routeKey) else { continue }
+            if let current = bestRoutes[routeKey], (current.routeHops ?? Int.max) <= (device.routeHops ?? Int.max) {
+                continue
+            }
+            bestRoutes[routeKey] = device
+        }
+        relayTargets = bestRoutes.values.map { device in
             CommandTarget(
                 id: "stikserver|\(device.id)",
                 name: device.name,
                 kind: .stikServer,
+                deviceKind: device.kind,
+                pairingIdentifier: device.pairingIdentifier,
                 serverAddress: connection.serverAddress,
                 serverToken: connection.accessToken,
                 relayDeviceID: device.id,
                 relayCapabilities: Set(device.capabilities ?? [])
             )
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        if let refreshed = relayTargets.first(where: { $0.id == selectedTarget.id }), refreshed != selectedTarget {
+            select(refreshed)
+        }
         NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
     }
 
@@ -239,7 +298,10 @@ extension PairingFileManager {
         let directory = FileManager.default.documentsDirectory
         let localPaths = Set([
             pairingFileURL(for: .rppairing).standardizedFileURL.path,
-            pairingFileURL(for: .lockdown).standardizedFileURL.path
+            pairingFileURL(for: .lockdown).standardizedFileURL.path,
+            FileManager.default.documentsDirectory
+                .appendingPathComponent(AppConstants.Pairing.legacyPairingFileName)
+                .standardizedFileURL.path
         ])
         let files = (try? FileManager.default.contentsOfDirectory(
             at: directory,
@@ -262,14 +324,22 @@ extension PairingFileManager {
 
 enum DeviceOperationScope {
     @TaskLocal static var scopedTarget: CommandTarget?
+    @TaskLocal static var isSessionActive = false
+    @TaskLocal static var relayOperationID: String?
 
     static var target: CommandTarget { scopedTarget ?? .local }
 
     static var requiresIPA: Bool { target.kind == .stikServer }
+
+    static func resolvedTarget() async -> CommandTarget {
+        if let scopedTarget { return scopedTarget }
+        return await CommandTargetManager.shared.snapshot()
+    }
 }
 
 enum RemoteDeviceError: LocalizedError {
     case missingPairingFile
+    case missingLocalPairingFile
     case missingEndpoint
     case unsupportedRelay
     case relayDisconnected
@@ -278,6 +348,7 @@ enum RemoteDeviceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingPairingFile: return "The selected device's pairing file is missing. Pair that device again without replacing this device's main pairing identity."
+        case .missingLocalPairingFile: return "SideStore cannot open a remote device session because this device's main pairing identity is unavailable. Pair this device again first."
         case .missingEndpoint: return "The selected nearby device no longer has a reachable endpoint."
         case .unsupportedRelay: return "This relay node does not advertise SideStore device-operation support. Open a compatible SideStore relay on the device's network."
         case .relayDisconnected: return "The StikServer relay disconnected during the operation."
@@ -299,7 +370,9 @@ private actor DeviceSessionSerializer {
             _ = await predecessor?.result
             try Task.checkCancellation()
             return try await DeviceOperationScope.$scopedTarget.withValue(target) {
-                try await DeviceSessionCoordinator.shared.withSession(for: target, operation: operation)
+                try await DeviceOperationScope.$isSessionActive.withValue(true) {
+                    try await DeviceSessionCoordinator.shared.withSession(for: target, operation: operation)
+                }
             }
         }
         previous = Task { _ = await task.result }
@@ -332,15 +405,32 @@ private actor DeviceSessionCoordinator {
             return try await operation()
         case .stikServer:
             guard target.supportsSideStoreOperations else { throw RemoteDeviceError.unsupportedRelay }
-            try await StikServerDeviceConnection.shared.beginOperation(target: target)
-            defer { Task { await StikServerDeviceConnection.shared.endOperation(target: target) } }
-            return try await operation()
+            let operationID = UUID().uuidString
+            try await StikServerDeviceConnection.shared.beginOperation(target: target, operationID: operationID)
+            do {
+                let result = try await DeviceOperationScope.$relayOperationID.withValue(operationID) {
+                    try await operation()
+                }
+                await StikServerDeviceConnection.shared.endOperation(
+                    target: target,
+                    operationID: operationID
+                )
+                return result
+            } catch {
+                await StikServerDeviceConnection.shared.endOperation(
+                    target: target,
+                    operationID: operationID
+                )
+                throw error
+            }
         case .nearby:
             guard let fileURL = target.pairingFileURL,
                   let pairing = try? String(contentsOf: fileURL) else { throw RemoteDeviceError.missingPairingFile }
             guard let host = target.host, !host.isEmpty else { throw RemoteDeviceError.missingEndpoint }
 
-            let localPairing = PairingFileManager.shared.fetchPairingFile()
+            guard let localPairing = PairingFileManager.shared.fetchPairingFile() else {
+                throw RemoteDeviceError.missingLocalPairingFile
+            }
             let config = ConnectionConfigBinding(
                 setTunnelIfaceIp: { _ in }, setTunnelPeerIp: { _ in },
                 setTunnelPeerSubnetMask: { _ in }, setTunnelPeerReachable: { _ in },
@@ -348,11 +438,13 @@ private actor DeviceSessionCoordinator {
                 setRemoteReachable: { _ in }, getOverrideTunnelPeerIp: { "" },
                 setOverrideTunnelPeerReachable: { _ in }, getConnectionMode: { .remoteServer }
             )
-            if let port = target.port { minimuxer.set(MinimuxerParams(remotePairingPort: port)) }
-            await minimuxer.core.bindConnectionConfig(config)
-            try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
-
             do {
+                if let port = target.port { minimuxer.set(MinimuxerParams(remotePairingPort: port)) }
+                await minimuxer.core.bindConnectionConfig(config)
+                try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
+                if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) {
+                    throw error.asOperationError
+                }
                 let result = try await operation()
                 try await restoreLocal(pairing: localPairing)
                 return result
@@ -363,16 +455,19 @@ private actor DeviceSessionCoordinator {
         }
     }
 
-    private func restoreLocal(pairing: String?) async throws {
+    private func restoreLocal(pairing: String) async throws {
         await bindConnectionConfig()
         minimuxer.set(MinimuxerParams(remotePairingPort: remotePairingPortCache))
-        if let pairing { try await minimuxer.core.reinitializePairingData(pairingFile: pairing) }
+        try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
     }
 }
 
 struct StikServerDevice: Decodable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String
+    let kind: String?
+    let pairingIdentifier: String?
+    let routeHops: Int?
     let connected: Bool?
     let controllable: Bool?
     let capabilities: [String]?
@@ -390,16 +485,24 @@ final class StikServerDeviceConnection: ObservableObject {
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var receiver: Task<Void, Never>?
+    private var heartbeat: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
 
     func connect(serverAddress: String, token: String) {
         disconnect()
         guard let url = Self.socketURL(serverAddress, token: token, role: "viewer") else {
-            errorMessage = "Invalid StikServer address"
+            let error = NSError(
+                domain: "StikServer",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid StikServer address"]
+            )
+            errorMessage = error.localizedDescription
+            NotificationCenter.default.post(name: .commandTargetConnectionFailed, object: error)
             return
         }
         self.serverAddress = serverAddress
         accessToken = token
+        errorMessage = nil
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForResource = 7 * 24 * 60 * 60
         let session = URLSession(configuration: configuration)
@@ -407,11 +510,13 @@ final class StikServerDeviceConnection: ObservableObject {
         self.session = session
         self.socket = socket
         socket.resume()
+        heartbeat = Self.makeHeartbeat(for: socket)
         receiver = Task { [weak self, weak socket] in
             guard let self, let socket else { return }
             do {
                 while !Task.isCancelled { self.receive(try await socket.receive()) }
             } catch {
+                self.devices = []
                 self.failAll(error)
             }
         }
@@ -420,20 +525,32 @@ final class StikServerDeviceConnection: ObservableObject {
     func disconnect() {
         receiver?.cancel()
         receiver = nil
+        heartbeat?.cancel()
+        heartbeat = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         session?.invalidateAndCancel()
         session = nil
         devices = []
-        failAll(RemoteDeviceError.relayDisconnected)
+        failAll(RemoteDeviceError.relayDisconnected, notify: false)
     }
 
-    func beginOperation(target: CommandTarget) async throws {
-        _ = try await request("sideStoreBegin", target: target, fields: [:], timeout: 20)
+    func beginOperation(target: CommandTarget, operationID: String) async throws {
+        _ = try await request(
+            "sideStoreBegin",
+            target: target,
+            fields: ["sessionId": operationID],
+            timeout: 20
+        )
     }
 
-    func endOperation(target: CommandTarget) async {
-        _ = try? await request("sideStoreEnd", target: target, fields: [:], timeout: 10)
+    func endOperation(target: CommandTarget, operationID: String) async {
+        _ = try? await request(
+            "sideStoreEnd",
+            target: target,
+            fields: ["sessionId": operationID],
+            timeout: 10
+        )
     }
 
     func request(
@@ -449,22 +566,32 @@ final class StikServerDeviceConnection: ObservableObject {
         payload["command"] = command
         payload["deviceId"] = deviceID
         payload["requestId"] = requestID
+        if payload["sessionId"] == nil, let operationID = DeviceOperationScope.relayOperationID {
+            payload["sessionId"] = operationID
+        }
         let data = try JSONSerialization.data(withJSONObject: payload)
         guard let text = String(data: data, encoding: .utf8) else {
             throw RemoteDeviceError.invalidRelayResponse("request encoding failed")
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
-            Task {
-                do {
-                    try await socket.send(.string(text))
-                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    guard let continuation = self.pending.removeValue(forKey: requestID) else { return }
-                    continuation.resume(throwing: StikServerRequestError.timedOut)
-                } catch {
-                    guard let continuation = self.pending.removeValue(forKey: requestID) else { return }
-                    continuation.resume(throwing: error)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pending[requestID] = continuation
+                Task {
+                    do {
+                        try await socket.send(.string(text))
+                        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                        guard let continuation = self.pending.removeValue(forKey: requestID) else { return }
+                        continuation.resume(throwing: StikServerRequestError.timedOut)
+                    } catch {
+                        guard let continuation = self.pending.removeValue(forKey: requestID) else { return }
+                        continuation.resume(throwing: error)
+                    }
                 }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let continuation = self?.pending.removeValue(forKey: requestID) else { return }
+                continuation.resume(throwing: CancellationError())
             }
         }
     }
@@ -474,6 +601,15 @@ final class StikServerDeviceConnection: ObservableObject {
               let data = text.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String else { return }
+        if type == "error" {
+            let message = object["message"] as? String ?? "StikServer reported an error"
+            failAll(NSError(
+                domain: "StikServer",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            ))
+            return
+        }
         if type == "devices", let raw = object["devices"],
            let encoded = try? JSONSerialization.data(withJSONObject: raw),
            let decoded = try? JSONDecoder().decode([StikServerDevice].self, from: encoded) {
@@ -492,11 +628,14 @@ final class StikServerDeviceConnection: ObservableObject {
         }
     }
 
-    private func failAll(_ error: Error) {
+    private func failAll(_ error: Error, notify: Bool = true) {
         let continuations = pending.values
         pending.removeAll()
         continuations.forEach { $0.resume(throwing: error) }
         errorMessage = error.localizedDescription
+        if notify {
+            NotificationCenter.default.post(name: .commandTargetConnectionFailed, object: error)
+        }
     }
 
     static func socketURL(_ address: String, token: String, role: String) -> URL? {
@@ -507,6 +646,16 @@ final class StikServerDeviceConnection: ObservableObject {
         components.path = "/\(role)"
         components.queryItems = token.isEmpty ? nil : [URLQueryItem(name: "token", value: token)]
         return components.url
+    }
+
+    nonisolated static func makeHeartbeat(for socket: URLSessionWebSocketTask) -> Task<Void, Never> {
+        Task { [weak socket] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard !Task.isCancelled, let socket else { return }
+                socket.sendPing { _ in }
+            }
+        }
     }
 }
 
@@ -553,10 +702,15 @@ enum RemoteDeviceOperations {
         }
     }
 
-    static func sendIPA(bundleID: String, data: Data) async throws {
+    static func sendIPA(
+        bundleID: String,
+        data: Data,
+        progressHandler: (@Sendable (Double) -> Void)? = nil
+    ) async throws {
         let target = DeviceOperationScope.target
         guard target.kind == .stikServer else {
             try await minimuxer.core.sendIpaAfc(bundleId: bundleID, ipaBytes: data)
+            progressHandler?(1)
             return
         }
         let uploadID = UUID().uuidString
@@ -582,6 +736,7 @@ enum RemoteDeviceOperations {
                 timeout: 60
             )
             offset = end
+            progressHandler?(Double(offset) / Double(max(data.count, 1)))
         }
         _ = try await StikServerDeviceConnection.shared.request(
             "sideStoreUploadCommit",
@@ -668,7 +823,7 @@ final class SideStoreRelayAgentManager {
     private func reconcile() {
         let targets = [CommandTarget.local] + CommandTargetManager.shared.nearbyTargets
         let ids = Set(targets.map(\.id))
-        for id in agents.keys where !ids.contains(id) {
+        for id in Array(agents.keys) where !ids.contains(id) {
             agents.removeValue(forKey: id)?.disconnect()
         }
         for target in targets where agents[target.id] == nil {
@@ -679,6 +834,61 @@ final class SideStoreRelayAgentManager {
     }
 }
 
+private actor RelayOperationLease {
+    private var isReady = false
+    private var isEnded = false
+    private var failureMessage: String?
+    private var readyWaiters: [CheckedContinuation<Void, Error>] = []
+    private var endWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilReady() async throws {
+        if let failureMessage {
+            throw NSError(
+                domain: "SideStoreRelay",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: failureMessage]
+            )
+        }
+        if isReady { return }
+        try await withCheckedThrowingContinuation { readyWaiters.append($0) }
+    }
+
+    func markReady() {
+        guard !isReady, failureMessage == nil else { return }
+        isReady = true
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilEnded() async {
+        if isEnded { return }
+        await withCheckedContinuation { endWaiters.append($0) }
+    }
+
+    func end() {
+        guard !isEnded else { return }
+        isEnded = true
+        let waiters = endWaiters
+        endWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func fail(_ message: String) {
+        failureMessage = message
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        waiters.forEach {
+            $0.resume(throwing: NSError(
+                domain: "SideStoreRelay",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            ))
+        }
+        end()
+    }
+}
+
 @MainActor
 final class SideStoreRelayAgent {
     private let target: CommandTarget
@@ -686,13 +896,23 @@ final class SideStoreRelayAgent {
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var receiver: Task<Void, Never>?
+    private var heartbeat: Task<Void, Never>?
     private var uploads: [String: RelayUpload] = [:]
+    private var heldOperation: HeldRelayOperation?
+    private var heldOperationTimeout: Task<Void, Never>?
 
     private struct RelayUpload {
         let bundleID: String
         let expectedSize: Int
+        let sessionID: String?
         let url: URL
         var receivedSize: Int
+    }
+
+    private struct HeldRelayOperation {
+        let id: String
+        let lease: RelayOperationLease
+        let task: Task<Void, Never>
     }
 
     init(target: CommandTarget) {
@@ -709,6 +929,7 @@ final class SideStoreRelayAgent {
         self.session = session
         self.socket = socket
         socket.resume()
+        heartbeat = StikServerDeviceConnection.makeHeartbeat(for: socket)
         receiver = Task { [weak self, weak socket] in
             guard let self, let socket else { return }
             await self.register(socket: socket)
@@ -716,6 +937,7 @@ final class SideStoreRelayAgent {
                 while !Task.isCancelled { await self.receive(try await socket.receive()) }
             } catch {
                 debugLog("[SideStoreRelayAgent] Relay stopped: \(error.localizedDescription)")
+                self.disconnect()
             }
         }
     }
@@ -723,6 +945,15 @@ final class SideStoreRelayAgent {
     func disconnect() {
         receiver?.cancel()
         receiver = nil
+        heartbeat?.cancel()
+        heartbeat = nil
+        heldOperationTimeout?.cancel()
+        heldOperationTimeout = nil
+        if let heldOperation {
+            heldOperation.task.cancel()
+            Task { await heldOperation.lease.end() }
+        }
+        heldOperation = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         session?.invalidateAndCancel()
@@ -734,14 +965,14 @@ final class SideStoreRelayAgent {
     private func register(socket: URLSessionWebSocketTask) async {
         let identifier = target.id == CommandTarget.local.id
             ? ((try? await minimuxer.core.fetchUDID()) ?? UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)
-            : target.id
+            : (target.pairingIdentifier ?? target.id.replacingOccurrences(of: "nearby|", with: ""))
         let agentID = "sidestore-agent|\(identifier)"
         let payload: [String: Any] = [
             "type": "register",
             "device": [
                 "id": agentID,
                 "name": target.name,
-                "kind": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
+                "kind": target.deviceKind ?? (UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"),
                 "serviceIdentifier": agentID,
                 "pairingIdentifier": identifier,
                 "paired": true,
@@ -772,6 +1003,26 @@ final class SideStoreRelayAgent {
     }
 
     private func execute(_ command: String, object: [String: Any]) async throws -> [String: Any] {
+        if command == "sideStoreBegin" {
+            guard let sessionID = object["sessionId"] as? String, !sessionID.isEmpty else {
+                throw RemoteDeviceError.invalidRelayResponse("missing operation session identifier")
+            }
+            try await beginHeldOperation(id: sessionID)
+            return [:]
+        }
+        if command == "sideStoreEnd" {
+            guard let sessionID = object["sessionId"] as? String, !sessionID.isEmpty else {
+                throw RemoteDeviceError.invalidRelayResponse("missing operation session identifier")
+            }
+            try await endHeldOperation(id: sessionID)
+            return [:]
+        }
+        if let heldOperation {
+            guard object["sessionId"] as? String == heldOperation.id else {
+                throw RemoteDeviceError.invalidRelayResponse("another device operation is already active")
+            }
+            return try await executeForSelectedTarget(command, object: object)
+        }
         if command == "sideStoreUploadBegin" || command == "sideStoreUploadChunk" {
             return try await executeForSelectedTarget(command, object: object)
         }
@@ -780,10 +1031,74 @@ final class SideStoreRelayAgent {
         }
     }
 
+    private func beginHeldOperation(id: String) async throws {
+        if let heldOperation {
+            guard heldOperation.id == id else {
+                throw RemoteDeviceError.invalidRelayResponse("another device operation is already active")
+            }
+            return
+        }
+
+        let lease = RelayOperationLease()
+        let target = self.target
+        let task = Task {
+            do {
+                try await DeviceOperationSession.run(target: target) {
+                    await lease.markReady()
+                    await lease.waitUntilEnded()
+                }
+            } catch {
+                await lease.fail(error.localizedDescription)
+            }
+        }
+        heldOperation = HeldRelayOperation(id: id, lease: lease, task: task)
+        heldOperationTimeout = Task {
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            task.cancel()
+            await lease.fail("Timed out waiting for the selected device session")
+        }
+
+        do {
+            try await lease.waitUntilReady()
+            heldOperationTimeout?.cancel()
+            heldOperationTimeout = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                try? await self?.endHeldOperation(id: id)
+            }
+        } catch {
+            if heldOperation?.id == id {
+                heldOperationTimeout?.cancel()
+                heldOperationTimeout = nil
+                heldOperation = nil
+            }
+            throw error
+        }
+    }
+
+    private func endHeldOperation(id: String) async throws {
+        guard let heldOperation else { return }
+        guard heldOperation.id == id else {
+            throw RemoteDeviceError.invalidRelayResponse("operation session identifier does not match")
+        }
+        heldOperationTimeout?.cancel()
+        heldOperationTimeout = nil
+        await heldOperation.lease.end()
+        _ = await heldOperation.task.result
+        let expiredUploadIDs = uploads.compactMap { $0.value.sessionID == id ? $0.key : nil }
+        for uploadID in expiredUploadIDs {
+            if let upload = uploads.removeValue(forKey: uploadID) {
+                try? FileManager.default.removeItem(at: upload.url)
+            }
+        }
+        if self.heldOperation?.id == id {
+            self.heldOperation = nil
+        }
+    }
+
     private func executeForSelectedTarget(_ command: String, object: [String: Any]) async throws -> [String: Any] {
         switch command {
-        case "sideStoreBegin", "sideStoreEnd":
-            return [:]
         case "sideStoreReady":
             if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) { throw error }
             return [:]
@@ -809,13 +1124,24 @@ final class SideStoreRelayAgent {
                   let size = object["size"] as? Int else { throw RemoteDeviceError.invalidRelayResponse("invalid upload request") }
             let url = FileManager.default.uniqueTemporaryURL().appendingPathExtension("ipa")
             FileManager.default.createFile(atPath: url.path, contents: nil)
-            uploads[uploadID] = RelayUpload(bundleID: bundleID, expectedSize: size, url: url, receivedSize: 0)
+            uploads[uploadID] = RelayUpload(
+                bundleID: bundleID,
+                expectedSize: size,
+                sessionID: object["sessionId"] as? String,
+                url: url,
+                receivedSize: 0
+            )
             return [:]
         case "sideStoreUploadChunk":
             guard let uploadID = object["uploadId"] as? String,
                   var upload = uploads[uploadID],
+                  let offset = object["offset"] as? Int,
                   let encoded = object["data"] as? String,
                   let data = Data(base64Encoded: encoded) else { throw RemoteDeviceError.invalidRelayResponse("invalid upload chunk") }
+            guard offset == upload.receivedSize,
+                  upload.receivedSize + data.count <= upload.expectedSize else {
+                throw RemoteDeviceError.invalidRelayResponse("upload chunk is out of order")
+            }
             let handle = try FileHandle(forWritingTo: upload.url)
             try handle.seekToEnd()
             try handle.write(contentsOf: data)

@@ -339,7 +339,9 @@ struct ConnectionConfigView: View {
                 UserDefaults.standard.remotePairingPortOverride = 0
             }
             syncMinimuxerBackendFromUserDefaults()
-            try? await fetchUDID(forceLive: true)
+            try? await DeviceOperationSession.run(target: .local) {
+                try await fetchUDID(forceLive: true)
+            }
         }
         await bindConnectionConfig()
         showConfirmDialog = true

@@ -37,7 +37,9 @@ final class SendAppOperation: BasePipelineOperation<InstallAppOperationContext, 
             if (UserDefaults.standard.preferResignedIPA || DeviceOperationScope.requiresIPA), let ipaURL = self.context.ipaURL {
                 debugLog("[SendAppOperation] Sending IPA at \(ipaURL.path) via AFC...")
                 let rawBytes = try Data(contentsOf: ipaURL, options: .mappedIfSafe)
-                try await sendIpaAfc(bundleIdentifier, rawBytes)
+                try await sendIpaAfc(bundleIdentifier, rawBytes) { [weak self] fraction in
+                    self?.setProgress(10 + Int64(fraction * 90))
+                }
             } else {
                 debugLog("[SendAppOperation] Sending App Bundle at \(appURL.path) via AFC...")
                 try await sendAppBundleAfc(bundleIdentifier, at: appURL)

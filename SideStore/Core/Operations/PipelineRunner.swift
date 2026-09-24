@@ -104,7 +104,7 @@ final class PipelineRunner: Sendable
                  group: RefreshGroup) async throws -> RefreshGroup
     {
         let target = await CommandTargetManager.shared.snapshot()
-        return try await DeviceOperationSession.run(target: target) {
+        return try await DeviceOperationScope.$scopedTarget.withValue(target) {
             try await self.performInTargetSession(operations, handler: handler, group: group)
         }
     }
@@ -163,6 +163,25 @@ final class PipelineRunner: Sendable
                 operation.logSummary(status: "FAILED", elapsed: elapsed, error: opError)
             }
             throw opError
+        }
+
+        let needsRegisteredDevice = operations.contains { operation in
+            switch operation {
+            case .install, .update, .reinstall, .refresh, .activate, .resign:
+                return true
+            case .deactivate, .deleteApp, .backup, .restore, .removeApp, .removeDeactivatedApp:
+                return false
+            }
+        }
+        if needsRegisteredDevice {
+            let target = DeviceOperationScope.target
+            let team = try await AuthManager.shared.getAuthenticatedTeam()
+            let registration = DeviceRegistrationFlow()
+            _ = try await registration.registerCurrentDevice(
+                for: team,
+                deviceName: target.name,
+                deviceType: target.developerPortalDeviceType
+            )
         }
         
         group.progress.totalUnitCount = Int64(operations.count * 100)
@@ -395,4 +414,3 @@ extension RefreshGroup {
         return ctx
     }
 }
-

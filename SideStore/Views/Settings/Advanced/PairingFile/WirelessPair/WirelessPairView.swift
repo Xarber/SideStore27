@@ -10,6 +10,12 @@ import SwiftUI
 
 struct WirelessPairView: View {
     @StateObject private var viewModel = WirelessPairViewModel()
+    @State private var didAutomaticallyPresentClient = false
+    let automaticallyPresentClient: Bool
+
+    init(automaticallyPresentClient: Bool = false) {
+        self.automaticallyPresentClient = automaticallyPresentClient
+    }
     
     private let spring = Animation.spring(response: 0.35, dampingFraction: 0.68)
     private let pulse = Animation.interactiveSpring(response: 1.5, dampingFraction: 0.55)
@@ -155,6 +161,10 @@ struct WirelessPairView: View {
         }
         .onAppear {
             debugLog("[WirelessPairView] onAppear (isAdvertising=\(viewModel.isAdvertising), serviceID=\(viewModel.serviceID ?? "nil"), port=\(viewModel.port.map(String.init) ?? "nil"))")
+            if automaticallyPresentClient && !didAutomaticallyPresentClient {
+                didAutomaticallyPresentClient = true
+                viewModel.openClientDialog()
+            }
         }
         .onDisappear {
             debugLog("[WirelessPairView] onDisappear (isAdvertising=\(viewModel.isAdvertising))")

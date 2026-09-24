@@ -31,6 +31,11 @@ public final class AppBootManager {
     
 
     public nonisolated func startMinimuxer(pairingFile: String) async throws {
+        if DeviceOperationScope.scopedTarget == nil {
+            return try await DeviceOperationScope.$scopedTarget.withValue(.local) {
+                try await self.startMinimuxer(pairingFile: pairingFile)
+            }
+        }
         debugLog("[AppBootManager] startMinimuxer() entered")
         defer { debugLog("[AppBootManager] startMinimuxer() exited") }
         

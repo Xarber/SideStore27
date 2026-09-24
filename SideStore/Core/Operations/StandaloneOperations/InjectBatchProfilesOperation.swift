@@ -41,26 +41,29 @@ final class InjectBatchProfilesOperation: BaseStandaloneOperation<StandaloneOper
         debugLog("[InjectBatchProfilesOperation] Running batch injection for \(self.batches.count) app(s)")
 
         await CellularRefreshManager.shared.turnOffDataIfNeeded()
-        for batch in self.batches {
-            debugLog("[InjectBatchProfilesOperation] Installing \(batch.profiles.count) profile(s) for \(batch.bundleID)...")
-            for profileData in batch.profiles {
-                try await installProvisioningProfiles(profileData)
-            }
+        let target = DeviceOperationScope.target
+        try await DeviceOperationSession.run(target: target) {
+            for batch in self.batches {
+                debugLog("[InjectBatchProfilesOperation] Installing \(batch.profiles.count) profile(s) for \(batch.bundleID)...")
+                for profileData in batch.profiles {
+                    try await installProvisioningProfiles(profileData)
+                }
 
-            if let installedApp = batch.app, let dbContext = installedApp.managedObjectContext {
-                debugLog("[InjectBatchProfilesOperation] Updating database record for \(batch.bundleID)...")
-                try await dbContext.perform {
-                    if let certStatus = batch.certStatus {
-                        installedApp.certificateStatus = certStatus
-                    }
-                    if dbContext.hasChanges {
-                        try dbContext.save()
+                if let installedApp = batch.app, let dbContext = installedApp.managedObjectContext {
+                    debugLog("[InjectBatchProfilesOperation] Updating database record for \(batch.bundleID)...")
+                    try await dbContext.perform {
+                        if let certStatus = batch.certStatus {
+                            installedApp.certificateStatus = certStatus
+                        }
+                        if dbContext.hasChanges {
+                            try dbContext.save()
+                        }
                     }
                 }
-            }
 
-            self.onAppCompleted?(batch.bundleID)
-            debugLog("[InjectBatchProfilesOperation] Successfully processed \(batch.bundleID)")
+                self.onAppCompleted?(batch.bundleID)
+                debugLog("[InjectBatchProfilesOperation] Successfully processed \(batch.bundleID)")
+            }
         }
         await CellularRefreshManager.shared.turnOnDataIfNeeded()
         debugLog("[InjectBatchProfilesOperation] Batch profile injection completed for all \(self.batches.count) app(s)")

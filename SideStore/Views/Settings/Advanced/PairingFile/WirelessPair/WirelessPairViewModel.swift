@@ -604,9 +604,9 @@ final class WirelessPairViewModel: ObservableObject {
             let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
             let sanitized = spaceReplaced.unicodeScalars.filter { allowed.contains($0) }.map(String.init).joined()
             let finalName = sanitized.isEmpty ? "device" : sanitized
-            return "\(finalName)\(AppConstants.Minimuxer.rpPairingFileSuffix)"
+            return "\(finalName)_\(UUID().uuidString)\(AppConstants.Minimuxer.rpPairingFileSuffix)"
         }
-        return AppConstants.Minimuxer.defaultRPPairingFileName
+        return "SideStoreRemote_\(UUID().uuidString)\(AppConstants.Minimuxer.rpPairingFileSuffix)"
     }
 
     private func pairingFilePath(for deviceName: String? = nil, model: String? = nil) -> String {
