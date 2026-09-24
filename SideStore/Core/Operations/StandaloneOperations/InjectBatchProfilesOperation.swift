@@ -44,13 +44,13 @@ final class InjectBatchProfilesOperation: BaseStandaloneOperation<StandaloneOper
         let target = DeviceOperationScope.target
         try await DeviceOperationSession.run(target: target) {
             for batch in self.batches {
-                debugLog("[InjectBatchProfilesOperation] Installing \(batch.profiles.count) profile(s) for \(batch.bundleID)...")
+                self.debugLog("[InjectBatchProfilesOperation] Installing \(batch.profiles.count) profile(s) for \(batch.bundleID)...")
                 for profileData in batch.profiles {
                     try await installProvisioningProfiles(profileData)
                 }
 
                 if let installedApp = batch.app, let dbContext = installedApp.managedObjectContext {
-                    debugLog("[InjectBatchProfilesOperation] Updating database record for \(batch.bundleID)...")
+                    self.debugLog("[InjectBatchProfilesOperation] Updating database record for \(batch.bundleID)...")
                     try await dbContext.perform {
                         if let certStatus = batch.certStatus {
                             installedApp.certificateStatus = certStatus
@@ -62,7 +62,7 @@ final class InjectBatchProfilesOperation: BaseStandaloneOperation<StandaloneOper
                 }
 
                 self.onAppCompleted?(batch.bundleID)
-                debugLog("[InjectBatchProfilesOperation] Successfully processed \(batch.bundleID)")
+                self.debugLog("[InjectBatchProfilesOperation] Successfully processed \(batch.bundleID)")
             }
         }
         await CellularRefreshManager.shared.turnOnDataIfNeeded()

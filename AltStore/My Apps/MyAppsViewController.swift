@@ -534,9 +534,6 @@ private extension MyAppsViewController {
                 if let previousAccountID {
                     try? await AccountCredentialStore.shared.activate(identifier: previousAccountID)
                 }
-                if let operationError = error as? OperationError, case .cancelled = operationError {
-                    return
-                }
                 let alert = UIAlertController(
                     title: NSLocalizedString("Unable to Add Apple ID", comment: ""),
                     message: error.localizedDescription,
