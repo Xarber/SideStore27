@@ -27,7 +27,9 @@ struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
     let kind: CommandTargetKind
     var deviceKind: String? = nil
     var pairingIdentifier: String? = nil
+    var advertisedServiceIdentifier: String? = nil
     var discoveryServiceID: String? = nil
+    var discoveryServiceType: String? = nil
     var host: String?
     var port: UInt16?
     var pairingFilePath: String?
@@ -132,13 +134,13 @@ final class CommandTargetManager: ObservableObject {
     }
 
     private func updateNearbyTargets(from services: [DiscoveredService]) {
-        let pairings = PairingFileManager.shared.remotePairingFiles()
-        var knownIdentifiers: [String: URL] = [:]
-        for pairing in pairings {
-            if let identifier = pairing.identifier?.lowercased(), knownIdentifiers[identifier] == nil {
-                knownIdentifiers[identifier] = pairing.url
-            }
+        let services = services.filter {
+            $0.type.contains("_apple-mobdev2._tcp")
+                || ($0.type.contains("_remotepairing._tcp")
+                    && !$0.type.contains("manual-pairing")
+                    && !$0.type.contains("pairable-host"))
         }
+        let pairings = PairingFileManager.shared.remotePairingFiles()
         let visibleServiceIDs = Set(services.map(\.id))
         for serviceID in Array(resolutionTasks.keys) where !visibleServiceIDs.contains(serviceID) {
             resolutionTasks.removeValue(forKey: serviceID)?.cancel()
@@ -158,28 +160,42 @@ final class CommandTargetManager: ObservableObject {
                 guard let self else { return }
                 let resolved = await Self.resolve(service)
                 guard !Task.isCancelled, let resolved else { return }
-                let txt = Dictionary(uniqueKeysWithValues: service.txtRecords.map { ($0.key.lowercased(), $0.value) })
-                let identifiers = [txt["identifier"], txt["uuid"], txt["deviceid"], txt["udid"]]
-                    .compactMap { $0?.lowercased() }
-                let normalizedName = service.name.lowercased().filter { $0.isLetter || $0.isNumber }
-                let pairing = identifiers.compactMap({ knownIdentifiers[$0] }).first
-                    ?? pairings.first(where: {
-                        $0.url.deletingPathExtension().lastPathComponent.lowercased()
-                            .filter { $0.isLetter || $0.isNumber }
-                            .contains(normalizedName)
-                    })?.url
-                guard let pairing else { return }
-                let id = identifiers.first ?? service.id
+                let txt = service.txtRecords.reduce(into: [String: String]()) {
+                    $0[$1.key.lowercased()] = $1.value
+                }
+                let mode: PairingProtocol = service.type.contains("apple-mobdev2") ? .lockdown : .rppairing
+                let compatiblePairings = pairings.filter { $0.mode == mode }
+                guard !compatiblePairings.isEmpty else { return }
+                let advertisedIdentifiers = [txt["identifier"], txt["uuid"], txt["deviceid"], txt["udid"]]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                let serviceIdentifier = advertisedIdentifiers.first ?? service.name
+                let normalizedName = Self.normalizedDeviceName(
+                    txt["name"] ?? txt["devicename"] ?? service.name
+                )
+                let pairing = compatiblePairings.first(where: {
+                    $0.serviceIdentifier == service.id
+                        || $0.serviceIdentifier?.caseInsensitiveCompare(serviceIdentifier) == .orderedSame
+                }) ?? compatiblePairings.first(where: {
+                    Self.normalizedDeviceName($0.displayName) == normalizedName
+                }) ?? (compatiblePairings.count == 1 ? compatiblePairings[0] : nil)
+                let displayName = txt["name"]
+                    ?? txt["devicename"]
+                    ?? pairing?.displayName
+                    ?? service.name
+                let id = serviceIdentifier.lowercased()
                 let target = CommandTarget(
                     id: "nearby|\(id)",
-                    name: service.name,
+                    name: displayName,
                     kind: .nearby,
-                    deviceKind: txt["model"] ?? txt["deviceclass"] ?? txt["kind"],
-                    pairingIdentifier: identifiers.first,
+                    deviceKind: txt["model"] ?? txt["modelidentifier"] ?? txt["deviceclass"] ?? txt["kind"] ?? pairing?.modelIdentifier,
+                    pairingIdentifier: pairing?.deviceIdentifier ?? advertisedIdentifiers.first,
+                    advertisedServiceIdentifier: serviceIdentifier,
                     discoveryServiceID: service.id,
+                    discoveryServiceType: service.type,
                     host: resolved.host,
                     port: resolved.port,
-                    pairingFilePath: pairing.path
+                    pairingFilePath: pairing?.url.path
                 )
                 if let index = self.nearbyTargets.firstIndex(where: { $0.id == target.id }) {
                     guard self.nearbyTargets[index] != target else { return }
@@ -201,16 +217,21 @@ final class CommandTargetManager: ObservableObject {
 
     private func updateRelayTargets(from devices: [StikServerDevice]) {
         let connection = StikServerDeviceConnection.shared
-        let directIdentifiers = Set(nearbyTargets.compactMap { $0.pairingIdentifier?.lowercased() })
+        let directIdentifiers = Set(nearbyTargets.flatMap {
+            [$0.pairingIdentifier, $0.advertisedServiceIdentifier].compactMap { $0?.lowercased() }
+        })
         var bestRoutes: [String: StikServerDevice] = [:]
-        for device in devices where device.connected != false {
-            let supportsSideStore = device.id.hasPrefix("sidestore-agent|")
-                || (device.capabilities ?? []).contains("sidestore.device.v1")
-            guard supportsSideStore else { continue }
+        for device in devices {
             let routeKey = device.pairingIdentifier?.lowercased() ?? device.id
             guard !directIdentifiers.contains(routeKey) else { continue }
-            if let current = bestRoutes[routeKey], (current.routeHops ?? Int.max) <= (device.routeHops ?? Int.max) {
-                continue
+            if let current = bestRoutes[routeKey] {
+                let currentSupported = Self.supportsSideStore(current)
+                let candidateSupported = Self.supportsSideStore(device)
+                if currentSupported != candidateSupported {
+                    if currentSupported { continue }
+                } else if Self.routeCost(current) <= Self.routeCost(device) {
+                    continue
+                }
             }
             bestRoutes[routeKey] = device
         }
@@ -233,65 +254,154 @@ final class CommandTargetManager: ObservableObject {
         NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
     }
 
+    private static func supportsSideStore(_ device: StikServerDevice) -> Bool {
+        device.id.hasPrefix("sidestore-agent|")
+            || (device.capabilities ?? []).contains("sidestore.device.v1")
+    }
+
+    private static func routeCost(_ device: StikServerDevice) -> Int {
+        device.mode == "direct" ? 0 : (device.routeHops ?? Int.max)
+    }
+
     private static func resolve(_ service: DiscoveredService) async -> (host: String, port: UInt16)? {
-        await withCheckedContinuation { continuation in
-            let parameters = NWParameters.tcp
-            parameters.includePeerToPeer = true
-            let connection = NWConnection(to: service.result.endpoint, using: parameters)
-            let lock = NSLock()
-            var resumed = false
-            let finish: ((String, UInt16)?) -> Void = { result in
-                lock.withLock {
-                    guard !resumed else { return }
-                    resumed = true
-                    connection.cancel()
-                    continuation.resume(returning: result)
-                }
-            }
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if case .hostPort(let host, let port) = connection.currentPath?.remoteEndpoint {
-                        finish((host.debugDescription.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), port.rawValue))
-                    } else {
-                        finish((service.name + ".local", AppConstants.Minimuxer.remotePairingPort))
-                    }
-                case .failed, .cancelled: finish(nil)
-                default: break
-                }
-            }
-            connection.start(queue: .global(qos: .userInitiated))
-            DispatchQueue.global().asyncAfter(deadline: .now() + 4) { finish(nil) }
-        }
+        guard let resolved = await BonjourDiscoveryManager.resolveEndpointWithoutConnecting(service) else { return nil }
+        let host = resolved.addresses.first(where: { !$0.contains(":") }) ?? resolved.addresses.first
+        guard let host else { return nil }
+        return (host, resolved.port)
+    }
+
+    private static func normalizedDeviceName(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map(String.init)
+            .joined()
     }
 }
 
-struct RemotePairingFile: Sendable {
+struct RemotePairingFile: Identifiable, Equatable, Sendable {
+    var id: String { url.path }
     let url: URL
     let identifier: String?
+    let mode: PairingProtocol
+    let displayName: String
+    let deviceIdentifier: String?
+    let modelIdentifier: String?
+    let serviceIdentifier: String?
+    let createdAt: Date
+    let lastConnectedAt: Date?
+}
+
+private struct RemotePairingMetadata: Codable, Sendable {
+    let fileName: String
+    var displayName: String
+    var deviceIdentifier: String?
+    var modelIdentifier: String?
+    var serviceIdentifier: String?
+    var createdAt: Date
+    var lastConnectedAt: Date?
 }
 
 extension PairingFileManager {
+    private static var remotePairingMetadataKey: String { "SideStoreRemotePairingMetadata.v1" }
+
     @discardableResult
     func importRemotePairingFile(from sourceURL: URL) throws -> RemotePairingFile {
         let (content, parsed) = try inspectPairingFile(from: sourceURL)
-        let identifier: String
+        let identifier: String?
+        let deviceIdentifier: String?
         if let remote = parsed as? RPPairingFile {
             identifier = remote.identifier
+            deviceIdentifier = nil
         } else if let lockdown = parsed as? LockdownPairingFile {
             identifier = lockdown.udid
+            deviceIdentifier = lockdown.udid
         } else {
             throw RemoteDeviceError.missingPairingFile
         }
+        if let existing = remotePairingFiles().first(where: {
+            (try? String(contentsOf: $0.url)) == content
+        }) {
+            return existing
+        }
 
-        let sanitized = identifier.unicodeScalars
-            .filter { CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }
-            .map(String.init)
-            .joined()
-        let fileName = "SideStoreRemote_\(sanitized.isEmpty ? UUID().uuidString : sanitized)_rp.plist"
+        let sourceName = sourceURL.deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = sourceName.isEmpty ? "Imported Device" : sourceName
+        let fileName = "SideStoreRemote_\(UUID().uuidString).plist"
         let destinationURL = FileManager.default.documentsDirectory.appendingPathComponent(fileName)
         try content.write(to: destinationURL, atomically: true, encoding: .utf8)
-        return RemotePairingFile(url: destinationURL, identifier: identifier)
+        var metadata = remotePairingMetadata()
+        let record = RemotePairingMetadata(
+            fileName: fileName,
+            displayName: displayName,
+            deviceIdentifier: deviceIdentifier,
+            modelIdentifier: nil,
+            serviceIdentifier: nil,
+            createdAt: Date(),
+            lastConnectedAt: nil
+        )
+        metadata.removeAll { $0.fileName == fileName }
+        metadata.append(record)
+        saveRemotePairingMetadata(metadata)
+        return RemotePairingFile(
+            url: destinationURL,
+            identifier: identifier,
+            mode: parsed.mode,
+            displayName: displayName,
+            deviceIdentifier: deviceIdentifier,
+            modelIdentifier: nil,
+            serviceIdentifier: nil,
+            createdAt: record.createdAt,
+            lastConnectedAt: nil
+        )
+    }
+
+    @discardableResult
+    func registerGeneratedRemotePairingFile(
+        at url: URL,
+        displayName: String,
+        modelIdentifier: String?
+    ) throws -> RemotePairingFile {
+        let content = try String(contentsOf: url)
+        let parsed = try parse(content: content)
+        let identifier: String?
+        let deviceIdentifier: String?
+        if let remote = parsed as? RPPairingFile {
+            identifier = remote.identifier
+            deviceIdentifier = nil
+        } else if let lockdown = parsed as? LockdownPairingFile {
+            identifier = lockdown.udid
+            deviceIdentifier = lockdown.udid
+        } else {
+            throw RemoteDeviceError.missingPairingFile
+        }
+        var metadata = remotePairingMetadata()
+        let existing = metadata.first(where: { $0.fileName == url.lastPathComponent })
+        let createdAt = existing?.createdAt ?? Date()
+        let record = RemotePairingMetadata(
+            fileName: url.lastPathComponent,
+            displayName: displayName.isEmpty ? "Paired Device" : displayName,
+            deviceIdentifier: deviceIdentifier,
+            modelIdentifier: modelIdentifier,
+            serviceIdentifier: existing?.serviceIdentifier,
+            createdAt: createdAt,
+            lastConnectedAt: existing?.lastConnectedAt
+        )
+        metadata.removeAll { $0.fileName == url.lastPathComponent }
+        metadata.append(record)
+        saveRemotePairingMetadata(metadata)
+        return RemotePairingFile(
+            url: url,
+            identifier: identifier,
+            mode: parsed.mode,
+            displayName: record.displayName,
+            deviceIdentifier: deviceIdentifier,
+            modelIdentifier: modelIdentifier,
+            serviceIdentifier: record.serviceIdentifier,
+            createdAt: createdAt,
+            lastConnectedAt: record.lastConnectedAt
+        )
     }
 
     nonisolated func remotePairingFiles() -> [RemotePairingFile] {
@@ -308,6 +418,9 @@ extension PairingFileManager {
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )) ?? []
+        let records = remotePairingMetadata().reduce(into: [String: RemotePairingMetadata]()) {
+            $0[$1.fileName] = $1
+        }
         return files.compactMap { url in
             guard !localPaths.contains(url.standardizedFileURL.path),
                   AppConstants.Pairing.supportedExtensions.contains(url.pathExtension.lowercased()),
@@ -317,8 +430,82 @@ extension PairingFileManager {
             if let rp = parsed as? RPPairingFile { identifier = rp.identifier }
             else if let lockdown = parsed as? LockdownPairingFile { identifier = lockdown.udid }
             else { identifier = nil }
-            return RemotePairingFile(url: url, identifier: identifier)
+            let record = records[url.lastPathComponent]
+            let fallbackName = url.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "SideStoreRemote_", with: "")
+            return RemotePairingFile(
+                url: url,
+                identifier: identifier,
+                mode: parsed.mode,
+                displayName: record?.displayName ?? fallbackName,
+                deviceIdentifier: record?.deviceIdentifier ?? (parsed as? LockdownPairingFile)?.udid,
+                modelIdentifier: record?.modelIdentifier,
+                serviceIdentifier: record?.serviceIdentifier,
+                createdAt: record?.createdAt ?? ((try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast),
+                lastConnectedAt: record?.lastConnectedAt
+            )
+        }.sorted {
+            ($0.lastConnectedAt ?? $0.createdAt) > ($1.lastConnectedAt ?? $1.createdAt)
         }
+    }
+
+    nonisolated func remotePairingFiles(for target: CommandTarget) -> [RemotePairingFile] {
+        let mode: PairingProtocol = target.discoveryServiceType?.contains("apple-mobdev2") == true ? .lockdown : .rppairing
+        let files = remotePairingFiles().filter { $0.mode == mode }
+        return files.sorted { lhs, rhs in
+            let lhsExact = lhs.url.path == target.pairingFilePath || lhs.serviceIdentifier == target.discoveryServiceID
+            let rhsExact = rhs.url.path == target.pairingFilePath || rhs.serviceIdentifier == target.discoveryServiceID
+            if lhsExact != rhsExact { return lhsExact }
+            return (lhs.lastConnectedAt ?? lhs.createdAt) > (rhs.lastConnectedAt ?? rhs.createdAt)
+        }
+    }
+
+    nonisolated func bindRemotePairingFile(
+        _ file: RemotePairingFile,
+        to target: CommandTarget,
+        deviceIdentifier: String?
+    ) {
+        var metadata = remotePairingMetadata()
+        let now = Date()
+        if let index = metadata.firstIndex(where: { $0.fileName == file.url.lastPathComponent }) {
+            metadata[index].displayName = target.name
+            metadata[index].deviceIdentifier = deviceIdentifier ?? metadata[index].deviceIdentifier
+            metadata[index].modelIdentifier = target.deviceKind ?? metadata[index].modelIdentifier
+            metadata[index].serviceIdentifier = target.discoveryServiceID
+            metadata[index].lastConnectedAt = now
+        } else {
+            metadata.append(RemotePairingMetadata(
+                fileName: file.url.lastPathComponent,
+                displayName: target.name,
+                deviceIdentifier: deviceIdentifier,
+                modelIdentifier: target.deviceKind,
+                serviceIdentifier: target.discoveryServiceID,
+                createdAt: file.createdAt,
+                lastConnectedAt: now
+            ))
+        }
+        saveRemotePairingMetadata(metadata)
+    }
+
+    nonisolated func deleteRemotePairingFile(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        var metadata = remotePairingMetadata()
+        metadata.removeAll { $0.fileName == url.lastPathComponent }
+        saveRemotePairingMetadata(metadata)
+    }
+
+    private nonisolated func remotePairingMetadata() -> [RemotePairingMetadata] {
+        guard let data = UserDefaults.standard.data(forKey: Self.remotePairingMetadataKey) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([RemotePairingMetadata].self, from: data)) ?? []
+    }
+
+    private nonisolated func saveRemotePairingMetadata(_ metadata: [RemotePairingMetadata]) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(metadata) else { return }
+        UserDefaults.standard.set(data, forKey: Self.remotePairingMetadataKey)
     }
 }
 
@@ -424,9 +611,9 @@ private actor DeviceSessionCoordinator {
                 throw error
             }
         case .nearby:
-            guard let fileURL = target.pairingFileURL,
-                  let pairing = try? String(contentsOf: fileURL) else { throw RemoteDeviceError.missingPairingFile }
             guard let host = target.host, !host.isEmpty else { throw RemoteDeviceError.missingEndpoint }
+            let candidateFiles = PairingFileManager.shared.remotePairingFiles(for: target)
+            guard !candidateFiles.isEmpty else { throw RemoteDeviceError.missingPairingFile }
 
             guard let localPairing = PairingFileManager.shared.fetchPairingFile() else {
                 throw RemoteDeviceError.missingLocalPairingFile
@@ -439,12 +626,33 @@ private actor DeviceSessionCoordinator {
                 setOverrideTunnelPeerReachable: { _ in }, getConnectionMode: { .remoteServer }
             )
             do {
-                if let port = target.port { minimuxer.set(MinimuxerParams(remotePairingPort: port)) }
                 await minimuxer.core.bindConnectionConfig(config)
-                try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
-                if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) {
-                    throw error.asOperationError
+                var connectedFile: RemotePairingFile?
+                var lastError: Error?
+                for file in candidateFiles {
+                    do {
+                        let pairing = try String(contentsOf: file.url)
+                        let port = target.port ?? file.mode.defaultPort
+                        minimuxer.gateway.setPort(port, for: file.mode)
+                        try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
+                        if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) {
+                            throw error.asOperationError
+                        }
+                        connectedFile = file
+                        break
+                    } catch {
+                        lastError = error
+                    }
                 }
+                guard let connectedFile else {
+                    throw lastError ?? RemoteDeviceError.missingPairingFile
+                }
+                let deviceIdentifier = try? await minimuxer.core.fetchUDID()
+                PairingFileManager.shared.bindRemotePairingFile(
+                    connectedFile,
+                    to: target,
+                    deviceIdentifier: deviceIdentifier
+                )
                 let result = try await operation()
                 try await restoreLocal(pairing: localPairing)
                 return result
@@ -458,6 +666,7 @@ private actor DeviceSessionCoordinator {
     private func restoreLocal(pairing: String) async throws {
         await bindConnectionConfig()
         minimuxer.set(MinimuxerParams(remotePairingPort: remotePairingPortCache))
+        minimuxer.gateway.setPort(PairingProtocol.lockdown.defaultPort, for: .lockdown)
         try await minimuxer.core.reinitializePairingData(pairingFile: pairing)
     }
 }
@@ -471,6 +680,7 @@ struct StikServerDevice: Decodable, Equatable, Identifiable, Sendable {
     let connected: Bool?
     let controllable: Bool?
     let capabilities: [String]?
+    let mode: String?
 }
 
 @MainActor
@@ -517,7 +727,7 @@ final class StikServerDeviceConnection: ObservableObject {
                 while !Task.isCancelled { self.receive(try await socket.receive()) }
             } catch {
                 self.devices = []
-                self.failAll(error)
+                self.failAll(Self.connectionError(error, address: serverAddress))
             }
         }
     }
@@ -642,10 +852,28 @@ final class StikServerDeviceConnection: ObservableObject {
         let value = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: value.contains("://") ? value : "http://\(value)"),
               components.host != nil else { return nil }
-        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        switch components.scheme?.lowercased() {
+        case "http": components.scheme = "ws"
+        case "https": components.scheme = "wss"
+        case "ws", "wss": break
+        default: return nil
+        }
         components.path = "/\(role)"
-        components.queryItems = token.isEmpty ? nil : [URLQueryItem(name: "token", value: token)]
+        var queryItems = (components.queryItems ?? []).filter { $0.name != "token" }
+        if !token.isEmpty { queryItems.append(URLQueryItem(name: "token", value: token)) }
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
         return components.url
+    }
+
+    private static func connectionError(_ error: Error, address: String) -> Error {
+        guard let urlError = error as? URLError, urlError.code == .badServerResponse else { return error }
+        return NSError(
+            domain: "StikServer",
+            code: urlError.errorCode,
+            userInfo: [NSLocalizedDescriptionKey:
+                "StikServer rejected the native WebSocket connection. Check the server address and access token, and make sure any reverse proxy forwards WebSockets to /viewer and /agent. Address: \(address)"
+            ]
+        )
     }
 
     nonisolated static func makeHeartbeat(for socket: URLSessionWebSocketTask) -> Task<Void, Never> {
@@ -973,7 +1201,7 @@ final class SideStoreRelayAgent {
                 "id": agentID,
                 "name": target.name,
                 "kind": target.deviceKind ?? (UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"),
-                "serviceIdentifier": agentID,
+                "serviceIdentifier": target.advertisedServiceIdentifier ?? agentID,
                 "pairingIdentifier": identifier,
                 "paired": true,
                 "routeHops": 1,

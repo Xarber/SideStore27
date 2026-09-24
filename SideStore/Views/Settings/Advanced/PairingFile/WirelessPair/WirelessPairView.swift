@@ -168,6 +168,9 @@ struct WirelessPairView: View {
         }
         .onDisappear {
             debugLog("[WirelessPairView] onDisappear (isAdvertising=\(viewModel.isAdvertising))")
+            viewModel.stopDiscovery()
+            if viewModel.isAdvertising { viewModel.stopPairing() }
+            CommandTargetManager.shared.startDiscovery()
         }
         .sheet(isPresented: $viewModel.isTargetDialogPresented) {
             if #available(iOS 16.0, tvOS 16.0, *) {

@@ -893,3 +893,76 @@ final class BonjourDiscoveryManager: NSObject, ObservableObject, NetServiceDeleg
         }
     }
 }
+
+private final class PassiveBonjourResolver: NSObject, NetServiceDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(addresses: [String], port: UInt16)?, Never>?
+    private var service: NetService?
+    private var timeoutTask: Task<Void, Never>?
+
+    func resolve(_ discovered: DiscoveredService) async -> (addresses: [String], port: UInt16)? {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            let type = discovered.type.hasSuffix(".") ? discovered.type : discovered.type + "."
+            let domain = discovered.domain.isEmpty
+                ? "local."
+                : (discovered.domain.hasSuffix(".") ? discovered.domain : discovered.domain + ".")
+            let service = NetService(domain: domain, type: type, name: discovered.name)
+            self.service = service
+            service.delegate = self
+            service.schedule(in: .main, forMode: .common)
+            service.resolve(withTimeout: 4)
+            timeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled else { return }
+                self?.finish(nil)
+            }
+        }
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        guard sender.port > 0, sender.port <= Int(UInt16.max) else {
+            finish(nil)
+            return
+        }
+        let addresses = BonjourDiscoveryManager.addressesFromNetService(sender)
+        let resolved = addresses.isEmpty
+            ? BonjourDiscoveryManager.resolveHostToIPs(sender.hostName ?? "")
+            : addresses
+        guard !resolved.isEmpty else {
+            finish(nil)
+            return
+        }
+        finish((resolved, UInt16(sender.port)))
+    }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        finish(nil)
+    }
+
+    private func finish(_ result: (addresses: [String], port: UInt16)?) {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+        let timeoutTask = self.timeoutTask
+        let service = self.service
+        self.continuation = nil
+        self.timeoutTask = nil
+        self.service = nil
+        lock.unlock()
+        timeoutTask?.cancel()
+        service?.stop()
+        continuation.resume(returning: result)
+    }
+}
+
+extension BonjourDiscoveryManager {
+    static func resolveEndpointWithoutConnecting(
+        _ service: DiscoveredService
+    ) async -> (addresses: [String], port: UInt16)? {
+        let resolver = PassiveBonjourResolver()
+        return await resolver.resolve(service)
+    }
+}

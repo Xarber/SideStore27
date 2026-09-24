@@ -28,29 +28,31 @@ struct WirelessPairTarget: Identifiable, Hashable {
     var ipv4: String?
     var ipv6: String?
     var port: UInt16
+
+    private var txt: [String: String] {
+        guard case .bonjour(let record) = service.result.metadata else { return [:] }
+        return record.dictionary.reduce(into: [String: String]()) {
+            $0[$1.key.lowercased()] = $1.value
+        }
+    }
     
     var name: String {
-        if case .bonjour(let txt) = service.result.metadata,
-           let customName = txt.dictionary["name"], !customName.isEmpty {
+        if let customName = txt["name"] ?? txt["devicename"], !customName.isEmpty {
             return customName
         }
         return service.name
+            .replacingOccurrences(of: "._remotepairing-pairable-host._tcp.local.", with: "")
+            .replacingOccurrences(of: "._remotepairing-manual-pairing._tcp.local.", with: "")
     }
     
     var rawType: String { service.type }
     
     var model: String? {
-        if case .bonjour(let txt) = service.result.metadata {
-            return txt.dictionary["model"]
-        }
-        return nil
+        txt["model"] ?? txt["modelidentifier"]
     }
     
     var uuid: String? {
-        if case .bonjour(let txt) = service.result.metadata {
-            return txt.dictionary["uuid"] ?? txt.dictionary["deviceid"]
-        }
-        return nil
+        txt["uuid"] ?? txt["deviceid"] ?? txt["identifier"]
     }
     
     var typeBadge: String {
@@ -101,7 +103,6 @@ final class WirelessPairViewModel: ObservableObject {
     
     private let pairingServiceTypes = [
         "_remotepairing-manual-pairing._tcp",
-        "_remotepairing._tcp",
         "_remotepairing-pairable-host._tcp"
     ]
     
@@ -318,99 +319,14 @@ final class WirelessPairViewModel: ObservableObject {
     
     private func resolveEndpoint(for service: DiscoveredService) async -> (ipv4: String?, ipv6: String?, port: UInt16) {
         debugLog("[WirelessPairViewModel] resolveEndpoint() starting for '\(service.name)' (\(service.type))...")
-        return await withCheckedContinuation { continuation in
-            let isTCP = service.type.contains("_tcp")
-            let params = isTCP ? NWParameters.tcp : NWParameters.udp
-            params.includePeerToPeer = true
-            
-            let conn = NWConnection(to: service.result.endpoint, using: params)
-            let lock = NSLock()
-            var didResume = false
-            
-            let resumeOnce: ((ipv4: String?, ipv6: String?, port: UInt16)) -> Void = { result in
-                lock.withLock {
-                    guard !didResume else { return }
-                    didResume = true
-                    conn.cancel()
-                    debugLog("[WirelessPairViewModel] resolveEndpoint() resolved '\(service.name)': v4=\(result.ipv4 ?? "none"), v6=\(result.ipv6 ?? "none"), port=\(result.port)")
-                    continuation.resume(returning: result)
-                }
-            }
-            
-            conn.pathUpdateHandler = { path in
-                if path.status == .satisfied, let remote = path.remoteEndpoint {
-                    var resolvedHost = ""
-                    var portVal: UInt16 = 0
-                    
-                    switch remote {
-                    case .hostPort(let host, let port):
-                        resolvedHost = "\(host)".strippingInterfaceScope
-                        portVal = port.rawValue
-                    case .service(let sName, _, let sDomain, _):
-                        let cleanDomain = sDomain.isEmpty ? "local" : (sDomain.hasSuffix(".") ? String(sDomain.dropLast()) : sDomain)
-                        resolvedHost = "\(sName).\(cleanDomain)"
-                        if let localEndpoint = path.localEndpoint, case .hostPort(_, let p) = localEndpoint {
-                            portVal = p.rawValue
-                        }
-                    default:
-                        resolvedHost = service.name
-                    }
-                    
-                    guard portVal > 0 else { return }
-                    let ips = BonjourDiscoveryManager.resolveHostToIPs(resolvedHost)
-                    let v4 = ips.first(where: { !$0.contains(":") && $0 != "0.0.0.0" })
-                        ?? (!resolvedHost.contains(":") && resolvedHost.filter({ $0 == "." }).count == 3 ? resolvedHost : nil)
-                    let v6 = ips.first(where: { $0.contains(":") })
-                        ?? (resolvedHost.contains(":") ? resolvedHost : nil)
-                    
-                    resumeOnce((v4, v6, portVal))
-                }
-            }
-            
-            conn.stateUpdateHandler = { state in
-                switch state {
-                case .ready, .waiting:
-                    guard let remote = conn.currentPath?.remoteEndpoint else { return }
-                    var resolvedHost = ""
-                    var portVal: UInt16 = 0
-                    
-                    switch remote {
-                    case .hostPort(let host, let port):
-                        resolvedHost = "\(host)".strippingInterfaceScope
-                        portVal = port.rawValue
-                    case .service(let sName, _, let sDomain, _):
-                        let cleanDomain = sDomain.isEmpty ? "local" : (sDomain.hasSuffix(".") ? String(sDomain.dropLast()) : sDomain)
-                        resolvedHost = "\(sName).\(cleanDomain)"
-                        if let localEndpoint = conn.currentPath?.localEndpoint, case .hostPort(_, let p) = localEndpoint {
-                            portVal = p.rawValue
-                        }
-                    default:
-                        resolvedHost = service.name
-                    }
-                    
-                    guard portVal > 0 else { return }
-                    let ips = BonjourDiscoveryManager.resolveHostToIPs(resolvedHost)
-                    let v4 = ips.first(where: { !$0.contains(":") && $0 != "0.0.0.0" })
-                        ?? (!resolvedHost.contains(":") && resolvedHost.filter({ $0 == "." }).count == 3 ? resolvedHost : nil)
-                    let v6 = ips.first(where: { $0.contains(":") })
-                        ?? (resolvedHost.contains(":") ? resolvedHost : nil)
-                    
-                    resumeOnce((v4, v6, portVal))
-                case .failed:
-                    debugLog("[WirelessPairViewModel] resolveEndpoint() NWConnection state .failed for '\(service.name)'")
-                    resumeOnce((nil, nil, 0))
-                default:
-                    break
-                }
-            }
-            
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) {
-                debugLog("[WirelessPairViewModel] resolveEndpoint() timeout (2.0s) reached for '\(service.name)'")
-                resumeOnce((nil, nil, 0))
-            }
-            
-            conn.start(queue: .global(qos: .userInitiated))
+        guard let resolved = await BonjourDiscoveryManager.resolveEndpointWithoutConnecting(service) else {
+            debugLog("[WirelessPairViewModel] resolveEndpoint() passive resolution failed for '\(service.name)'")
+            return (nil, nil, 0)
         }
+        let ipv4 = resolved.addresses.first { !$0.contains(":") && $0 != "0.0.0.0" }
+        let ipv6 = resolved.addresses.first { $0.contains(":") }
+        debugLog("[WirelessPairViewModel] resolveEndpoint() resolved '\(service.name)': v4=\(ipv4 ?? "none"), v6=\(ipv6 ?? "none"), port=\(resolved.port)")
+        return (ipv4, ipv6, resolved.port)
     }
     
     func startDiscovery() {
@@ -456,8 +372,21 @@ final class WirelessPairViewModel: ObservableObject {
                 debugLog("[WirelessPairViewModel] startDiscovery() Task was cancelled during endpoint resolution")
                 return
             }
-            finalTargets.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            self.discoveredTargets = finalTargets
+            let grouped = Dictionary(grouping: finalTargets) { target in
+                let identifier = target.uuid ?? target.name
+                return identifier.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                    .unicodeScalars
+                    .filter { CharacterSet.alphanumerics.contains($0) }
+                    .map(String.init)
+                    .joined()
+            }
+            self.discoveredTargets = grouped.values.compactMap { matches in
+                matches.sorted { lhs, rhs in
+                    if (lhs.ipv4 != nil) != (rhs.ipv4 != nil) { return lhs.ipv4 != nil }
+                    if (lhs.port > 0) != (rhs.port > 0) { return lhs.port > 0 }
+                    return lhs.rawType.contains("manual-pairing")
+                }.first
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             self.isScanning = false
             debugLog("[WirelessPairViewModel] one-shot pass complete: \(self.discoveredTargets.count) targets ready:")
             for t in self.discoveredTargets {
@@ -518,6 +447,12 @@ final class WirelessPairViewModel: ObservableObject {
                     self.subStatusText = "Successfully paired with \(device.name) (\(device.model))!\nPairing file saved to documents."
                     self.shareSheetURL = URL(fileURLWithPath: device.pairingFilePath)
                     self.isShareSheetPresented = true
+                    try? PairingFileManager.shared.registerGeneratedRemotePairingFile(
+                        at: URL(fileURLWithPath: device.pairingFilePath),
+                        displayName: device.name,
+                        modelIdentifier: device.model
+                    )
+                    CommandTargetManager.shared.startDiscovery()
                 case .failure(let error):
                     debugLog("[WirelessPairViewModel] startPairing() FAILURE: error='\(error.localizedDescription)'")
                     self.errorMessage = error.localizedDescription
@@ -581,6 +516,12 @@ final class WirelessPairViewModel: ObservableObject {
                     self.subStatusText = "Successfully paired with \(device.name) (\(device.model))!\nPairing file saved to documents."
                     self.shareSheetURL = URL(fileURLWithPath: device.pairingFilePath)
                     self.isShareSheetPresented = true
+                    try? PairingFileManager.shared.registerGeneratedRemotePairingFile(
+                        at: URL(fileURLWithPath: device.pairingFilePath),
+                        displayName: device.name,
+                        modelIdentifier: device.model
+                    )
+                    CommandTargetManager.shared.startDiscovery()
                 case .failure(let error):
                     debugLog("[WirelessPairViewModel] triggerPairing() FAILURE: error='\(error.localizedDescription)'")
                     self.errorMessage = error.localizedDescription

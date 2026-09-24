@@ -17,6 +17,7 @@ import MinimuxerCommon
 public final class PairingFileManagementViewModel: ObservableObject {
     public enum ActiveAlert: Identifiable {
         case deleteConfirmation(PairingProtocol)
+        case deleteRemotePairing(String)
         case resetConfirmation
         case resetCompleted
         case importError(String)
@@ -24,6 +25,7 @@ public final class PairingFileManagementViewModel: ObservableObject {
         public var id: String {
             switch self {
             case .deleteConfirmation(let p): return "delete_\(p.rawValue)"
+            case .deleteRemotePairing(let path): return "deleteRemote_\(path)"
             case .resetConfirmation: return "reset"
             case .resetCompleted: return "resetCompleted"
             case .importError(let msg): return "importError_\(msg)"
@@ -39,6 +41,8 @@ public final class PairingFileManagementViewModel: ObservableObject {
     @Published public var targetImportMode: PairingProtocol? = nil
     @Published public var activeAlert: ActiveAlert? = nil
     @Published public var isActivating: Bool = false
+    @Published var remotePairingFiles: [RemotePairingFile] = []
+    @Published var isImportingRemotePairing = false
 
     public let supportedProtocols: [PairingProtocol] = [.lockdown, .rppairing]
 
@@ -53,6 +57,7 @@ public final class PairingFileManagementViewModel: ObservableObject {
     public func refresh() {
         activeProtocol = PairingFileManager.shared.activeProtocol
         preferredProtocol = PairingFileManager.shared.preferredProtocol
+        remotePairingFiles = PairingFileManager.shared.remotePairingFiles()
     }
 
     public func toggleGlobalHide() {
@@ -78,6 +83,17 @@ public final class PairingFileManagementViewModel: ObservableObject {
     public func handleImportResult(_ result: Result<URL, Error>) {
         switch result {
         case .success(let url):
+            if isImportingRemotePairing {
+                isImportingRemotePairing = false
+                do {
+                    try PairingFileManager.shared.importRemotePairingFile(from: url)
+                    refresh()
+                    CommandTargetManager.shared.startDiscovery()
+                } catch {
+                    activeAlert = .importError("Failed to import device pairing file: \(error.localizedDescription)")
+                }
+                return
+            }
             guard let (_, parsed) = try? PairingFileManager.shared.inspectPairingFile(from: url) else {
                 do {
                     try PairingFileManager.shared.importPairingFile(from: url, preferred: targetImportMode)
@@ -103,8 +119,25 @@ public final class PairingFileManagementViewModel: ObservableObject {
                 activeAlert = .importError("Failed to import pairing file: \(error.localizedDescription)")
             }
         case .failure(let error):
+            isImportingRemotePairing = false
             activeAlert = .importError(error.localizedDescription)
         }
+    }
+
+    func promptRemotePairingImport() {
+        targetImportMode = nil
+        isImportingRemotePairing = true
+        showFileImporter = true
+    }
+
+    func confirmDeleteRemotePairing(_ file: RemotePairingFile) {
+        activeAlert = .deleteRemotePairing(file.url.path)
+    }
+
+    func deleteRemotePairing(at path: String) {
+        PairingFileManager.shared.deleteRemotePairingFile(at: URL(fileURLWithPath: path))
+        refresh()
+        CommandTargetManager.shared.startDiscovery()
     }
 
     public func confirmProtocolMismatch(url: URL, newProtocol: PairingProtocol) {
@@ -212,6 +245,9 @@ public final class PairingFileManagementViewModel: ObservableObject {
 
     public func resetAllPairingFiles() {
         PairingFileManager.shared.resetAllPairingFiles()
+        for file in PairingFileManager.shared.remotePairingFiles() {
+            PairingFileManager.shared.deleteRemotePairingFile(at: file.url)
+        }
         refresh()
         activeAlert = .resetCompleted
     }

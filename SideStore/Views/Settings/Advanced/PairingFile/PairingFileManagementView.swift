@@ -23,6 +23,7 @@ struct PairingFileManagementView: View {
             VStack(alignment: .leading, spacing: 24) {
                 activeProtocolSection
                 pairingFilesSection
+                remoteDevicePairingsSection
                 pairingMethodsSection
                 managementSection
             }
@@ -67,6 +68,15 @@ struct PairingFileManagementView: View {
                     },
                     secondaryButton: .cancel()
                 )
+            case .deleteRemotePairing(let path):
+                return Alert(
+                    title: Text("Delete Device Pairing?"),
+                    message: Text("This removes only the selected remote device identity. This device's main SideStore pairing remains unchanged."),
+                    primaryButton: .destructive(Text("Delete")) {
+                        viewModel.deleteRemotePairing(at: path)
+                    },
+                    secondaryButton: .cancel()
+                )
             case .resetConfirmation:
                 return Alert(
                     title: Text("Reset Pairing Files?"),
@@ -89,6 +99,76 @@ struct PairingFileManagementView: View {
                     dismissButton: .default(Text("OK"))
                 )
             }
+        }
+    }
+
+    private var remoteDevicePairingsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("REMOTE DEVICE PAIRINGS")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(Color.white.opacity(0.6))
+                .padding(.horizontal, 4)
+
+            VStack(spacing: 0) {
+                if viewModel.remotePairingFiles.isEmpty {
+                    Text("No separate device pairing files have been added.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                    divider
+                } else {
+                    ForEach(Array(viewModel.remotePairingFiles.enumerated()), id: \.element.id) { index, file in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Image(systemName: file.mode == .rppairing ? "iphone.radiowaves.left.and.right" : "iphone.and.arrow.forward")
+                                    .foregroundColor(.cyan)
+                                Text(file.displayName)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundColor(.white)
+                                Spacer()
+                                Text(file.serviceIdentifier == nil ? "Unmatched" : "Matched")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(file.serviceIdentifier == nil ? .orange : .green)
+                            }
+                            Text(file.modelIdentifier ?? file.mode.rawValue)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(file.url.lastPathComponent)
+                                .font(.caption2.monospaced())
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .padding(16)
+                        .contentShape(Rectangle())
+                        .contextMenu {
+                            SwiftUI.Button(role: .destructive) {
+                                viewModel.confirmDeleteRemotePairing(file)
+                            } label: {
+                                Label("Delete Device Pairing", systemImage: "trash")
+                            }
+                        }
+                        if index < viewModel.remotePairingFiles.count - 1 { divider }
+                    }
+                    divider
+                }
+
+                SwiftUI.Button {
+                    viewModel.promptRemotePairingImport()
+                } label: {
+                    Label("Add Remote Device Pairing", systemImage: "doc.badge.plus")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+            }
+            .background(Color.settingsRowBackground)
+            .cornerRadius(14)
+
+            Text("Each entry is kept separate from this device's main SideStore identity. Unmatched files are tested only against a selected nearby device and become bound after a successful connection.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 4)
         }
     }
 

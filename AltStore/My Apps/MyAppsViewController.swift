@@ -486,7 +486,7 @@ private extension MyAppsViewController {
     }
 
     func presentWirelessPairing() {
-        let controller = UIHostingController(rootView: WirelessPairView(automaticallyPresentClient: true))
+        let controller = UIHostingController(rootView: WirelessPairView())
         controller.title = NSLocalizedString("Pair Nearby Device", comment: "")
         navigationController?.pushViewController(controller, animated: true)
     }
@@ -3038,11 +3038,15 @@ extension MyAppsViewController: UIDocumentPickerDelegate
         if isImportingRemotePairingFile {
             isImportingRemotePairingFile = false
             do {
-                try PairingFileManager.shared.importRemotePairingFile(from: fileURL)
+                let pairing = try PairingFileManager.shared.importRemotePairingFile(from: fileURL)
                 CommandTargetManager.shared.startDiscovery()
+                rebuildCommandTargetMenu()
                 let toast = ToastView(
                     text: NSLocalizedString("Device Pairing File Added", comment: ""),
-                    detailText: NSLocalizedString("SideStore kept this device's main pairing identity unchanged.", comment: "")
+                    detailText: String(
+                        format: NSLocalizedString("%@ was stored separately. It will appear as soon as its device is reachable nearby.", comment: ""),
+                        pairing.displayName
+                    )
                 )
                 toast.show(in: self.view)
             } catch {
