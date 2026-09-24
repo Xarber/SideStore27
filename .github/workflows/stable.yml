@@ -12,7 +12,6 @@ concurrency:
 
 jobs:
   build:
-    name: Build SideStore - stable
     name: Build SideStore stable using Xcode 27
     runs-on: xcode-27
 
