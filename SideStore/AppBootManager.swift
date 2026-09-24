@@ -144,5 +144,12 @@ public final class AppBootManager {
         }()
         
         _ = await (jitCheck, minimuxerCheck)
+
+        if let address = UserDefaults.standard.string(forKey: "StikServerAddress"), !address.isEmpty {
+            let token = Keychain.shared.stikServerAccessToken ?? ""
+            await MainActor.run {
+                CommandTargetManager.shared.connectStikServer(address: address, token: token)
+            }
+        }
     }
 }

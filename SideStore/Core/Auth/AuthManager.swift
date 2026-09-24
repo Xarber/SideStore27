@@ -23,6 +23,11 @@ public final class AuthManager: @unchecked Sendable {
     private var team: ALTTeam?
     private var session: ALTAppleAPISession?
 
+    func invalidateCachedAuthentication() {
+        team = nil
+        session = nil
+    }
+
     public var isAuthenticated: Bool {
         let hasEmail = Keychain.shared.appleIDEmailAddress != nil
         let hasPassword = Keychain.shared.appleIDPassword != nil
@@ -145,6 +150,7 @@ public final class AuthManager: @unchecked Sendable {
         skipResign: Bool = false,
         skipHowTos: Bool = false
     ) async throws -> SignInResult {
+        await AccountCredentialStore.shared.captureActiveAccount()
         let dbBackgroundContext = DatabaseManager.shared.persistentContainer.newBackgroundContext()
         let signInFlowHandler = SignInFlowHandler(presentingViewController: presentingViewController)
         let context = StandaloneOperationContext(
@@ -164,6 +170,8 @@ public final class AuthManager: @unchecked Sendable {
         let result = try await signInOperation.execute()
         self.team = result.team
         self.session = result.session
+        let accountIdentifier = result.team.account?.identifier ?? result.team.identifier
+        AccountCredentialStore.shared.captureCurrentAccount(identifier: accountIdentifier)
         return result
     }
     

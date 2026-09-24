@@ -103,6 +103,16 @@ final class PipelineRunner: Sendable
                  handler: PipelineExecutionHandler,
                  group: RefreshGroup) async throws -> RefreshGroup
     {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) {
+            try await self.performInTargetSession(operations, handler: handler, group: group)
+        }
+    }
+
+    private func performInTargetSession(_ operations: [AppOperation],
+                 handler: PipelineExecutionHandler,
+                 group: RefreshGroup) async throws -> RefreshGroup
+    {
         let operations = operations.filter { progress.progress(for: $0) == nil || progress.progress(for: $0)?.isCancelled == true }
         guard !operations.isEmpty else { throw OperationError.cancelled }
         
@@ -385,5 +395,4 @@ extension RefreshGroup {
         return ctx
     }
 }
-
 

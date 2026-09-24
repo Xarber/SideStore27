@@ -34,7 +34,7 @@ final class SendAppOperation: BasePipelineOperation<InstallAppOperationContext, 
         do {
             await CellularRefreshManager.shared.turnOffDataIfNeeded()
             
-            if UserDefaults.standard.preferResignedIPA, let ipaURL = self.context.ipaURL {
+            if (UserDefaults.standard.preferResignedIPA || DeviceOperationScope.requiresIPA), let ipaURL = self.context.ipaURL {
                 debugLog("[SendAppOperation] Sending IPA at \(ipaURL.path) via AFC...")
                 let rawBytes = try Data(contentsOf: ipaURL, options: .mappedIfSafe)
                 try await sendIpaAfc(bundleIdentifier, rawBytes)

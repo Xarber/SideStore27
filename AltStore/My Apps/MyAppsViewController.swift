@@ -65,6 +65,8 @@ class MyAppsViewController: UICollectionViewController
     private var pendingImportURL: URL?
     
     private var minimuxerStatusCheckTask: Task<Void, Never>?
+    private var commandTargetButton: UIBarButtonItem?
+    private var commandTargetObservers: [NSObjectProtocol] = []
     
     // Cache
     private var cachedUpdateSizes = [String: CGSize]()
@@ -84,6 +86,7 @@ class MyAppsViewController: UICollectionViewController
         if !(minimuxerStatusCheckTask?.isCancelled == true) {
             minimuxerStatusCheckTask?.cancel()
         }
+        commandTargetObservers.forEach(NotificationCenter.default.removeObserver)
     }
     
     override func viewDidLoad()
@@ -156,6 +159,8 @@ class MyAppsViewController: UICollectionViewController
         Task { @MainActor [weak self] in
             self?.activeTeam = try? await AuthManager.shared.getAuthenticatedTeam()
         }
+
+        self.configureCommandTargetPicker()
     }
     
     override func viewIsAppearing(_ animated: Bool)
@@ -192,6 +197,9 @@ class MyAppsViewController: UICollectionViewController
         
         _viewDidAppear = true
 
+        CommandTargetManager.shared.startDiscovery()
+        rebuildCommandTargetMenu()
+
         if let pendingURL = self.pendingImportURL {
             self.pendingImportURL = nil
             self.presentImportDialog(for: pendingURL)
@@ -201,6 +209,7 @@ class MyAppsViewController: UICollectionViewController
     override func viewWillDisappear(_ animated: Bool)
     {
         super.viewWillDisappear(animated)
+        CommandTargetManager.shared.stopDiscovery()
     }
     
     private func findView(in view: UIView, where predicate: (UIView) -> Bool) -> UIView? {
@@ -323,6 +332,115 @@ class MyAppsViewController: UICollectionViewController
 
 
 }
+
+#if !os(tvOS)
+private extension MyAppsViewController {
+    func configureCommandTargetPicker() {
+        let button = UIBarButtonItem(
+            image: UIImage(systemName: "iphone.gen3.radiowaves.left.and.right"),
+            menu: UIMenu(title: NSLocalizedString("Command Target", comment: ""), children: [])
+        )
+        button.accessibilityLabel = NSLocalizedString("Command target and Apple ID", comment: "")
+        navigationItem.rightBarButtonItem = button
+        commandTargetButton = button
+        commandTargetObservers = [
+            NotificationCenter.default.addObserver(forName: .commandTargetDidChange, object: nil, queue: .main) { [weak self] _ in
+                self?.rebuildCommandTargetMenu()
+            },
+            NotificationCenter.default.addObserver(forName: .signingAccountDidChange, object: nil, queue: .main) { [weak self] _ in
+                self?.rebuildCommandTargetMenu()
+            }
+        ]
+        rebuildCommandTargetMenu()
+    }
+
+    func rebuildCommandTargetMenu() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let manager = CommandTargetManager.shared
+            let isBusy = AppManager.shared.isActivelyManagingAnyApp
+            let targets = [CommandTarget.local] + manager.nearbyTargets + manager.relayTargets
+            let targetActions = targets.map { target in
+                UIAction(
+                    title: target.name,
+                    subtitle: target.kind == .stikServer && !target.supportsSideStoreOperations
+                        ? NSLocalizedString("Relay does not support SideStore operations", comment: "")
+                        : nil,
+                    image: UIImage(systemName: target.kind == .local ? "iphone" : target.kind == .nearby ? "iphone.radiowaves.left.and.right" : "network"),
+                    attributes: isBusy ? [.disabled] : [],
+                    state: manager.selectedTarget.id == target.id ? .on : .off
+                ) { _ in manager.select(target) }
+            }
+
+            await AccountCredentialStore.shared.captureActiveAccount()
+            let accounts = await AccountCredentialStore.shared.availableAccounts()
+            let accountActions = accounts.map { account in
+                UIAction(title: account.appleID, attributes: isBusy ? [.disabled] : [], state: account.isActive ? .on : .off) { [weak self] _ in
+                    Task { @MainActor in
+                        do {
+                            try await AccountCredentialStore.shared.activate(identifier: account.identifier)
+                            self?.activeTeam = try? await AuthManager.shared.getAuthenticatedTeam()
+                            self?.collectionView.reloadData()
+                        } catch {
+                            guard let self else { return }
+                            let alert = UIAlertController(title: NSLocalizedString("Unable to Switch Apple ID", comment: ""), message: error.localizedDescription, preferredStyle: .alert)
+                            alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+                            self.present(alert, animated: true)
+                        }
+                    }
+                }
+            }
+
+            let connect = UIAction(
+                title: NSLocalizedString("Connect to StikServer…", comment: ""),
+                image: UIImage(systemName: "server.rack")
+            ) { [weak self] _ in self?.presentStikServerConnection() }
+            let refresh = UIAction(
+                title: NSLocalizedString("Refresh Devices", comment: ""),
+                image: UIImage(systemName: "arrow.clockwise")
+            ) { [weak self] _ in
+                CommandTargetManager.shared.startDiscovery()
+                self?.rebuildCommandTargetMenu()
+            }
+            self.commandTargetButton?.menu = UIMenu(children: [
+                UIMenu(title: NSLocalizedString("Install and Refresh On", comment: ""), options: .displayInline, children: targetActions),
+                UIMenu(title: NSLocalizedString("Signing Apple ID", comment: ""), options: .displayInline, children: accountActions),
+                UIMenu(options: .displayInline, children: [refresh, connect])
+            ])
+            self.commandTargetButton?.accessibilityValue = "\(manager.selectedTarget.name), \(AuthManager.shared.currentAppleID ?? "No Apple ID")"
+        }
+    }
+
+    func presentStikServerConnection() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("Connect to StikServer", comment: ""),
+            message: NSLocalizedString("Enter the native StikServer address and optional access token. SideStore does not load the server's web interface.", comment: ""),
+            preferredStyle: .alert
+        )
+        alert.addTextField { field in
+            field.placeholder = "https://server.example:8765"
+            field.text = UserDefaults.standard.string(forKey: "StikServerAddress")
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addTextField { field in
+            field.placeholder = NSLocalizedString("Access token (optional)", comment: "")
+            field.text = Keychain.shared.stikServerAccessToken
+            field.isSecureTextEntry = true
+        }
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Connect", comment: ""), style: .default) { [weak self, weak alert] _ in
+            guard let address = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty else { return }
+            let token = alert?.textFields?.dropFirst().first?.text ?? ""
+            UserDefaults.standard.set(address, forKey: "StikServerAddress")
+            Keychain.shared.stikServerAccessToken = token
+            CommandTargetManager.shared.connectStikServer(address: address, token: token)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.rebuildCommandTargetMenu() }
+        })
+        present(alert, animated: true)
+    }
+}
+#endif
 
 private extension MyAppsViewController
 {

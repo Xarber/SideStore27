@@ -59,6 +59,12 @@ public class Keychain
     
     @KeychainItem(key: "appleIDXcodeToken")
     public var appleIDXcodeToken: String?
+
+    @KeychainItem(key: "sideStoreAccountCredentialRecords")
+    public var accountCredentialRecords: Data?
+
+    @KeychainItem(key: "stikServerAccessToken")
+    public var stikServerAccessToken: String?
     
     @KeychainItem(key: "signingCertificate")
     public var signingCertificate: Data?

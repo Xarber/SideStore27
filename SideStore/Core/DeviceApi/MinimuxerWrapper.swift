@@ -132,6 +132,7 @@ private func withRemotePairingRetry<T>(_ operation: () async throws -> T) async 
     do {
         return try await operation()
     } catch {
+        guard DeviceOperationScope.target.kind != .stikServer else { throw error }
         guard UserDefaults.standard.isAutoRetryRemotePairingPortEnabled,
               minimuxer.gateway.pairingFileType == .rppairing,
               isRetriableRemotePairingError(error) else 
@@ -205,6 +206,14 @@ public func isMinimuxerReady() async -> Result<Bool, MinimuxerError> {
 }
 
 public func ensureMinimuxerReady() async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await ensureMinimuxerReady() }
+    }
+    if DeviceOperationScope.target.kind != .local {
+        try await RemoteDeviceOperations.ensureReady()
+        return
+    }
     if CellularRefreshManager.shared.isEnabled && UserDefaults.standard.enableEMPforWireguard {
         throw OperationError.invalidVPN(
             reason: "WireGuard VPN is not supported with Cellular Refresh because iOS pauses the WireGuard tunnel when cellular data is toggled off."
@@ -274,108 +283,132 @@ func minimuxerStop() async throws {
 }
 
 func installProvisioningProfiles(_ profileData: Data) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await installProvisioningProfiles(profileData) }
+    }
     defer { debugLog("[SideStore] installProvisioningProfiles(profileData) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] installProvisioningProfiles(profileData) is no-op on simulator")
     #else
     debugLog("[SideStore] installProvisioningProfiles(profileData) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.installProvisioningProfile(profile: profileData)
-    }
+    try await withRemotePairingRetry { try await RemoteDeviceOperations.installProfile(profileData) }
     #endif
 }
 
 func removeProvisioningProfile(_ id: String) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await removeProvisioningProfile(id) }
+    }
     defer { debugLog("[SideStore] removeProvisioningProfile(id) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] removeProvisioningProfile(id) is no-op on simulator")
     #else
     debugLog("[SideStore] removeProvisioningProfile(id) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.removeProvisioningProfile(id: id)
-    }
+    try await withRemotePairingRetry { try await RemoteDeviceOperations.removeProfile(id) }
     #endif
 }
 
 func removeApp(_ bundleId: String) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await removeApp(bundleId) }
+    }
     defer { debugLog("[SideStore] removeApp(bundleId) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] removeApp(bundleId) is no-op on simulator")
     #else
     debugLog("[SideStore] removeApp(bundleId) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.removeApp(bundleId: bundleId)
-    }
+    try await withRemotePairingRetry { try await RemoteDeviceOperations.removeApp(bundleId) }
     #endif
 }
 
 func sendIpaAfc(_ bundleId: String, _ rawBytes: Data) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await sendIpaAfc(bundleId, rawBytes) }
+    }
     defer { debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) is no-op on simulator")
     #else
     debugLog("[SideStore] sendIpaAfc(bundleId, rawBytes) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.sendIpaAfc(bundleId: bundleId, ipaBytes: rawBytes)
-    }
+    try await withRemotePairingRetry { try await RemoteDeviceOperations.sendIPA(bundleID: bundleId, data: rawBytes) }
     #endif
 }
 
 func sendAppBundleAfc(_ bundleId: String, at appURL: URL) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await sendAppBundleAfc(bundleId, at: appURL) }
+    }
     defer { debugLog("[SideStore] sendAppBundleAfc(bundleId, appURL) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] sendAppBundleAfc(bundleId, appURL) is no-op on simulator")
     #else
     debugLog("[SideStore] sendAppBundleAfc(bundleId, appURL) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.sendAppBundleAfc(bundleId: bundleId, appURL: appURL)
+    if DeviceOperationScope.requiresIPA {
+        throw OperationError.invalidParameters("Remote relay targets require an IPA payload.")
     }
+    try await withRemotePairingRetry { try await minimuxer.core.sendAppBundleAfc(bundleId: bundleId, appURL: appURL) }
     #endif
 }
 
 func installIPA(_ bundleId: String) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await installIPA(bundleId) }
+    }
     defer { debugLog("[SideStore] installIPA(bundleId) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] installIPA(bundleId) is no-op on simulator")
     #else
     debugLog("[SideStore] installIPA(bundleId) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.installIpa(bundleId: bundleId)
-    }
+    try await withRemotePairingRetry { try await RemoteDeviceOperations.installIPA(bundleID: bundleId) }
     #endif
 }
 
 func installAppBundle(_ bundleId: String, appName: String) async throws {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await installAppBundle(bundleId, appName: appName) }
+    }
     defer { debugLog("[SideStore] installAppBundle(bundleId, appName) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] installAppBundle(bundleId, appName) is no-op on simulator")
     #else
     debugLog("[SideStore] installAppBundle(bundleId, appName) invoked")
-    try await withRemotePairingRetry {
-        try await minimuxer.core.installAppBundle(bundleId: bundleId, appName: appName)
+    if DeviceOperationScope.requiresIPA {
+        throw OperationError.invalidParameters("Remote relay targets require IPA installation.")
     }
+    try await withRemotePairingRetry { try await minimuxer.core.installAppBundle(bundleId: bundleId, appName: appName) }
     #endif
 }
 
 @discardableResult
 func fetchUDID(forceLive: Bool = false) async throws -> String {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await fetchUDID(forceLive: forceLive) }
+    }
     defer { debugLog("[SideStore] fetchUDID() completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] fetchUDID() is no-op on simulator")
     return "00008030-001234567890ABCD"
     
     #else
-    if !forceLive, let cachedUDID = Keychain.shared.deviceUDID, !cachedUDID.isEmpty {
+    if DeviceOperationScope.target.kind == .local, !forceLive, let cachedUDID = Keychain.shared.deviceUDID, !cachedUDID.isEmpty {
         debugLog("[SideStore] fetchUDID() returning cached UDID from Keychain: \(cachedUDID)")
         return cachedUDID
     }
     debugLog("[SideStore] fetchUDID() invoked (forceLive: \(forceLive))")
     return try await withRemotePairingRetry {
-        let udid = try await minimuxer.core.fetchUDID()
+        let udid = try await RemoteDeviceOperations.fetchUDID()
         guard !udid.isEmpty else {
             throw OperationError.unknownUDID(reason: "Minimuxer returned empty UDID.")
         }
-        Keychain.shared.deviceUDID = udid
+        if DeviceOperationScope.target.kind == .local { Keychain.shared.deviceUDID = udid }
         return udid
     }
     #endif
@@ -422,6 +455,10 @@ func safeAttachDebugger(_ pid: UInt32) async throws {
 }
 
 func dumpProfiles(_ docsPath: String, mode: ProfileDumpMode = .zip) async throws -> String {
+    if DeviceOperationScope.scopedTarget == nil {
+        let target = await CommandTargetManager.shared.snapshot()
+        return try await DeviceOperationSession.run(target: target) { try await dumpProfiles(docsPath, mode: mode) }
+    }
     defer { debugLog("[SideStore] dumpProfiles(docsPath) completed") }
     #if targetEnvironment(simulator)
     debugLog("[SideStore] dumpProfiles(docsPath) is no-op on simulator")
@@ -429,7 +466,7 @@ func dumpProfiles(_ docsPath: String, mode: ProfileDumpMode = .zip) async throws
     #else
     debugLog("[SideStore] dumpProfiles(docsPath) invoked")
     return try await withRemotePairingRetry {
-        try await minimuxer.core.dumpProfiles(docsPath: docsPath, mode: mode)
+        try await RemoteDeviceOperations.dumpProfiles(to: docsPath, mode: mode)
     }
     #endif
 }

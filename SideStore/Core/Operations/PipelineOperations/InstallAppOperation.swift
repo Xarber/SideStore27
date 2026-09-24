@@ -185,7 +185,7 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
         }
         
         // Phase 2: App installation
-        if UserDefaults.standard.preferResignedIPA {
+        if UserDefaults.standard.preferResignedIPA || DeviceOperationScope.requiresIPA {
             try await installIPA(bundleID)
         } else {
             try await installAppBundle(bundleID, appName: resignedAppBundle.fileURL.lastPathComponent)
