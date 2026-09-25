@@ -116,7 +116,10 @@ final class CommandTargetManager: ObservableObject {
     func startDiscovery() {
         isDiscovering = true
         BonjourDiscoveryManager.shared.discoverInstances(
-            ofTypes: ["_remotepairing._tcp.", "_apple-mobdev2._tcp."],
+            // CoreDevice remote pairing is the supported network path on modern
+            // iOS. _apple-mobdev2 also exposes this device's loopback lockdown
+            // service, which made the local UDID look like a remote IP address.
+            ofTypes: ["_remotepairing._tcp."],
             clearExisting: true
         )
     }
@@ -129,16 +132,16 @@ final class CommandTargetManager: ObservableObject {
     }
 
     func connectStikServer(address: String, token: String) {
-        StikServerDeviceConnection.shared.connect(serverAddress: address, token: token)
-        SideStoreRelayAgentManager.shared.connect(serverAddress: address, token: token)
+        let resolvedToken = StikServerDeviceConnection.accessToken(from: address, explicitToken: token)
+        StikServerDeviceConnection.shared.connect(serverAddress: address, token: resolvedToken)
+        SideStoreRelayAgentManager.shared.connect(serverAddress: address, token: resolvedToken)
     }
 
     private func updateNearbyTargets(from services: [DiscoveredService]) {
         let services = services.filter {
-            $0.type.contains("_apple-mobdev2._tcp")
-                || ($0.type.contains("_remotepairing._tcp")
-                    && !$0.type.contains("manual-pairing")
-                    && !$0.type.contains("pairable-host"))
+            $0.type.contains("_remotepairing._tcp")
+                && !$0.type.contains("manual-pairing")
+                && !$0.type.contains("pairable-host")
         }
         let pairings = PairingFileManager.shared.remotePairingFiles()
         let visibleServiceIDs = Set(services.map(\.id))
@@ -163,9 +166,10 @@ final class CommandTargetManager: ObservableObject {
                 let txt = service.txtRecords.reduce(into: [String: String]()) {
                     $0[$1.key.lowercased()] = $1.value
                 }
-                let mode: PairingProtocol = service.type.contains("apple-mobdev2") ? .lockdown : .rppairing
-                let compatiblePairings = pairings.filter { $0.mode == mode }
-                guard !compatiblePairings.isEmpty else { return }
+                // Publish unpaired devices too. The old flow hid them until a
+                // pairing file had somehow already been associated, making a
+                // successful import appear to do nothing.
+                let compatiblePairings = pairings.filter { $0.mode == .rppairing }
                 let advertisedIdentifiers = [txt["identifier"], txt["uuid"], txt["deviceid"], txt["udid"]]
                     .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
@@ -174,11 +178,11 @@ final class CommandTargetManager: ObservableObject {
                     txt["name"] ?? txt["devicename"] ?? service.name
                 )
                 let pairing = compatiblePairings.first(where: {
-                    $0.serviceIdentifier == service.id
+                    $0.serviceIdentifier?.caseInsensitiveCompare(service.id) == .orderedSame
                         || $0.serviceIdentifier?.caseInsensitiveCompare(serviceIdentifier) == .orderedSame
                 }) ?? compatiblePairings.first(where: {
                     Self.normalizedDeviceName($0.displayName) == normalizedName
-                }) ?? (compatiblePairings.count == 1 ? compatiblePairings[0] : nil)
+                })
                 let displayName = txt["name"]
                     ?? txt["devicename"]
                     ?? pairing?.displayName
@@ -325,7 +329,9 @@ extension PairingFileManager {
             return existing
         }
 
-        let sourceName = sourceURL.deletingPathExtension().lastPathComponent
+        let sourceStem = sourceURL.deletingPathExtension()
+        let modelIdentifier = sourceStem.pathExtension.isEmpty ? nil : sourceStem.pathExtension
+        let sourceName = sourceStem.deletingPathExtension().lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = sourceName.isEmpty ? "Imported Device" : sourceName
         let fileName = "SideStoreRemote_\(UUID().uuidString).plist"
@@ -336,7 +342,7 @@ extension PairingFileManager {
             fileName: fileName,
             displayName: displayName,
             deviceIdentifier: deviceIdentifier,
-            modelIdentifier: nil,
+            modelIdentifier: modelIdentifier,
             serviceIdentifier: nil,
             createdAt: Date(),
             lastConnectedAt: nil
@@ -350,11 +356,18 @@ extension PairingFileManager {
             mode: parsed.mode,
             displayName: displayName,
             deviceIdentifier: deviceIdentifier,
-            modelIdentifier: nil,
+            modelIdentifier: modelIdentifier,
             serviceIdentifier: nil,
             createdAt: record.createdAt,
             lastConnectedAt: nil
         )
+    }
+
+    @discardableResult
+    func importRemotePairingFile(from sourceURL: URL, for target: CommandTarget) throws -> RemotePairingFile {
+        let file = try importRemotePairingFile(from: sourceURL)
+        bindRemotePairingFile(file, to: target, deviceIdentifier: file.deviceIdentifier)
+        return remotePairingFiles().first(where: { $0.url == file.url }) ?? file
     }
 
     @discardableResult
@@ -471,7 +484,7 @@ extension PairingFileManager {
             metadata[index].displayName = target.name
             metadata[index].deviceIdentifier = deviceIdentifier ?? metadata[index].deviceIdentifier
             metadata[index].modelIdentifier = target.deviceKind ?? metadata[index].modelIdentifier
-            metadata[index].serviceIdentifier = target.discoveryServiceID
+            metadata[index].serviceIdentifier = target.advertisedServiceIdentifier ?? target.discoveryServiceID
             metadata[index].lastConnectedAt = now
         } else {
             metadata.append(RemotePairingMetadata(
@@ -479,7 +492,7 @@ extension PairingFileManager {
                 displayName: target.name,
                 deviceIdentifier: deviceIdentifier,
                 modelIdentifier: target.deviceKind,
-                serviceIdentifier: target.discoveryServiceID,
+                serviceIdentifier: target.advertisedServiceIdentifier ?? target.discoveryServiceID,
                 createdAt: file.createdAt,
                 lastConnectedAt: now
             ))
@@ -683,12 +696,20 @@ struct StikServerDevice: Decodable, Equatable, Identifiable, Sendable {
     let mode: String?
 }
 
+enum StikServerConnectionState: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case failed(String)
+}
+
 @MainActor
 final class StikServerDeviceConnection: ObservableObject {
     static let shared = StikServerDeviceConnection()
 
     @Published private(set) var devices: [StikServerDevice] = []
     @Published private(set) var errorMessage: String?
+    @Published private(set) var state: StikServerConnectionState = .disconnected
     private(set) var serverAddress = ""
     private(set) var accessToken = ""
 
@@ -696,6 +717,7 @@ final class StikServerDeviceConnection: ObservableObject {
     private var socket: URLSessionWebSocketTask?
     private var receiver: Task<Void, Never>?
     private var heartbeat: Task<Void, Never>?
+    private var connectionTimeout: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
 
     func connect(serverAddress: String, token: String) {
@@ -707,12 +729,14 @@ final class StikServerDeviceConnection: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Invalid StikServer address"]
             )
             errorMessage = error.localizedDescription
+            state = .failed(error.localizedDescription)
             NotificationCenter.default.post(name: .commandTargetConnectionFailed, object: error)
             return
         }
         self.serverAddress = serverAddress
-        accessToken = token
+        accessToken = Self.accessToken(from: serverAddress, explicitToken: token)
         errorMessage = nil
+        state = .connecting
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForResource = 7 * 24 * 60 * 60
         let session = URLSession(configuration: configuration)
@@ -720,6 +744,20 @@ final class StikServerDeviceConnection: ObservableObject {
         self.session = session
         self.socket = socket
         socket.resume()
+        connectionTimeout = Task { [weak self, weak socket] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  let socket,
+                  self.socket === socket,
+                  self.state == .connecting else { return }
+            socket.cancel(with: .goingAway, reason: nil)
+            self.failAll(NSError(
+                domain: "StikServer",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "StikServer did not respond. Check that this device can open the copied address in Safari and that the access token is current."]
+            ))
+        }
         heartbeat = Self.makeHeartbeat(for: socket)
         receiver = Task { [weak self, weak socket] in
             guard let self, let socket else { return }
@@ -737,11 +775,14 @@ final class StikServerDeviceConnection: ObservableObject {
         receiver = nil
         heartbeat?.cancel()
         heartbeat = nil
+        connectionTimeout?.cancel()
+        connectionTimeout = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         session?.invalidateAndCancel()
         session = nil
         devices = []
+        state = .disconnected
         failAll(RemoteDeviceError.relayDisconnected, notify: false)
     }
 
@@ -824,6 +865,10 @@ final class StikServerDeviceConnection: ObservableObject {
            let encoded = try? JSONSerialization.data(withJSONObject: raw),
            let decoded = try? JSONDecoder().decode([StikServerDevice].self, from: encoded) {
             devices = decoded
+            connectionTimeout?.cancel()
+            connectionTimeout = nil
+            errorMessage = nil
+            state = .connected
             return
         }
         if type == "deviceEvent", let event = object["event"] as? [String: Any],
@@ -842,8 +887,9 @@ final class StikServerDeviceConnection: ObservableObject {
         let continuations = pending.values
         pending.removeAll()
         continuations.forEach { $0.resume(throwing: error) }
-        errorMessage = error.localizedDescription
         if notify {
+            errorMessage = error.localizedDescription
+            state = .failed(error.localizedDescription)
             NotificationCenter.default.post(name: .commandTargetConnectionFailed, object: error)
         }
     }
@@ -859,10 +905,19 @@ final class StikServerDeviceConnection: ObservableObject {
         default: return nil
         }
         components.path = "/\(role)"
-        var queryItems = (components.queryItems ?? []).filter { $0.name != "token" }
-        if !token.isEmpty { queryItems.append(URLQueryItem(name: "token", value: token)) }
-        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        let resolvedToken = accessToken(from: address, explicitToken: token)
+        components.queryItems = resolvedToken.isEmpty ? nil : [URLQueryItem(name: "token", value: resolvedToken)]
         return components.url
+    }
+
+    nonisolated static func accessToken(from address: String, explicitToken: String) -> String {
+        let value = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = URLComponents(string: value.contains("://") ? value : "http://\(value)")
+        if let copiedToken = components?.queryItems?.first(where: { $0.name == "token" })?.value,
+           !copiedToken.isEmpty {
+            return copiedToken
+        }
+        return explicitToken
     }
 
     private static func connectionError(_ error: Error, address: String) -> Error {

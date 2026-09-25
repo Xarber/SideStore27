@@ -67,7 +67,6 @@ class MyAppsViewController: UICollectionViewController
     private var minimuxerStatusCheckTask: Task<Void, Never>?
     private var commandTargetButton: UIBarButtonItem?
     private var commandTargetObservers: [NSObjectProtocol] = []
-    private var isImportingRemotePairingFile = false
     private var isManagingSigningAccounts = false
     
     // Cache
@@ -338,11 +337,15 @@ class MyAppsViewController: UICollectionViewController
 #if !os(tvOS)
 private extension MyAppsViewController {
     func configureCommandTargetPicker() {
+        let openDevices = UIAction { [weak self] _ in
+            self?.presentDeviceCenter()
+        }
         let button = UIBarButtonItem(
             image: UIImage(systemName: "iphone.gen3.radiowaves.left.and.right"),
+            primaryAction: openDevices,
             menu: UIMenu(title: NSLocalizedString("Command Target", comment: ""), children: [])
         )
-        button.accessibilityLabel = NSLocalizedString("Command target and Apple ID", comment: "")
+        button.accessibilityLabel = NSLocalizedString("Devices", comment: "")
         navigationItem.rightBarButtonItem = button
         commandTargetButton = button
         commandTargetObservers = [
@@ -383,10 +386,13 @@ private extension MyAppsViewController {
                 let subtitle: String?
                 let isUnavailable = !availableTargetIDs.contains(target.id)
                 let isUnsupportedRelay = target.kind == .stikServer && !target.supportsSideStoreOperations
+                let isUnpairedNearby = target.kind == .nearby && target.pairingFileURL == nil
                 if isUnavailable {
                     subtitle = NSLocalizedString("Unavailable — refresh devices or reconnect", comment: "")
                 } else if isUnsupportedRelay {
                     subtitle = NSLocalizedString("Relay does not support SideStore operations", comment: "")
+                } else if isUnpairedNearby {
+                    subtitle = NSLocalizedString("Open Devices to import its pairing file", comment: "")
                 } else {
                     subtitle = nil
                 }
@@ -394,7 +400,7 @@ private extension MyAppsViewController {
                     title: target.name,
                     subtitle: subtitle,
                     image: UIImage(systemName: target.kind == .local ? "iphone" : target.kind == .nearby ? "iphone.radiowaves.left.and.right" : "network"),
-                    attributes: isBusy || isUnavailable || isUnsupportedRelay ? [.disabled] : [],
+                    attributes: isBusy || isUnavailable || isUnsupportedRelay || isUnpairedNearby ? [.disabled] : [],
                     state: manager.selectedTarget.id == target.id ? .on : .off
                 ) { _ in manager.select(target) }
             }
@@ -424,79 +430,24 @@ private extension MyAppsViewController {
                 attributes: isBusy ? [.disabled] : []
             ) { [weak self] _ in self?.addSigningAccount() }
 
-            let connect = UIAction(
-                title: NSLocalizedString("Connect to StikServer…", comment: ""),
-                image: UIImage(systemName: "server.rack"),
+            let manageDevices = UIAction(
+                title: NSLocalizedString("Devices…", comment: ""),
+                image: UIImage(systemName: "iphone.gen3.radiowaves.left.and.right"),
                 attributes: isBusy ? [.disabled] : []
-            ) { [weak self] _ in self?.presentStikServerConnection() }
-            let refresh = UIAction(
-                title: NSLocalizedString("Refresh Devices", comment: ""),
-                image: UIImage(systemName: "arrow.clockwise"),
-                attributes: isBusy ? [.disabled] : []
-            ) { [weak self] _ in
-                CommandTargetManager.shared.startDiscovery()
-                self?.rebuildCommandTargetMenu()
-            }
-            let pairNearby = UIAction(
-                title: NSLocalizedString("Pair Nearby Device…", comment: ""),
-                image: UIImage(systemName: "link.badge.plus"),
-                attributes: isBusy ? [.disabled] : []
-            ) { [weak self] _ in self?.presentWirelessPairing() }
-            let importPairing = UIAction(
-                title: NSLocalizedString("Import Device Pairing File…", comment: ""),
-                image: UIImage(systemName: "doc.badge.plus"),
-                attributes: isBusy ? [.disabled] : []
-            ) { [weak self] _ in self?.presentRemotePairingFilePicker() }
+            ) { [weak self] _ in self?.presentDeviceCenter() }
             self.commandTargetButton?.menu = UIMenu(children: [
                 UIMenu(title: NSLocalizedString("Install and Refresh On", comment: ""), options: .displayInline, children: targetActions),
                 UIMenu(title: NSLocalizedString("Signing Apple ID", comment: ""), options: .displayInline, children: accountActions + [addAccount]),
-                UIMenu(options: .displayInline, children: [refresh, pairNearby, importPairing, connect])
+                UIMenu(options: .displayInline, children: [manageDevices])
             ])
             self.commandTargetButton?.accessibilityValue = "\(manager.selectedTarget.name), \(AuthManager.shared.currentAppleID ?? "No Apple ID")"
         }
     }
 
-    func presentStikServerConnection() {
-        let alert = UIAlertController(
-            title: NSLocalizedString("Connect to StikServer", comment: ""),
-            message: NSLocalizedString("Enter the native StikServer address and optional access token. SideStore does not load the server's web interface.", comment: ""),
-            preferredStyle: .alert
-        )
-        alert.addTextField { field in
-            field.placeholder = "https://server.example:8765"
-            field.text = UserDefaults.standard.string(forKey: "StikServerAddress")
-            field.autocapitalizationType = .none
-            field.autocorrectionType = .no
-        }
-        alert.addTextField { field in
-            field.placeholder = NSLocalizedString("Access token (optional)", comment: "")
-            field.text = Keychain.shared.stikServerAccessToken
-            field.isSecureTextEntry = true
-        }
-        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
-        alert.addAction(UIAlertAction(title: NSLocalizedString("Connect", comment: ""), style: .default) { [weak self, weak alert] _ in
-            guard let address = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty else { return }
-            let token = alert?.textFields?.dropFirst().first?.text ?? ""
-            UserDefaults.standard.set(address, forKey: "StikServerAddress")
-            Keychain.shared.stikServerAccessToken = token
-            CommandTargetManager.shared.connectStikServer(address: address, token: token)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.rebuildCommandTargetMenu() }
-        })
-        present(alert, animated: true)
-    }
-
-    func presentWirelessPairing() {
-        let controller = UIHostingController(rootView: WirelessPairView())
-        controller.title = NSLocalizedString("Pair Nearby Device", comment: "")
+    func presentDeviceCenter() {
+        let controller = UIHostingController(rootView: DeviceCenterView())
+        controller.title = NSLocalizedString("Devices", comment: "")
         navigationController?.pushViewController(controller, animated: true)
-    }
-
-    func presentRemotePairingFilePicker() {
-        isImportingRemotePairingFile = true
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: PairingFileManager.supportedContentTypes)
-        picker.delegate = self
-        picker.allowsMultipleSelection = false
-        present(picker, animated: true)
     }
 
     func addSigningAccount() {
@@ -3035,32 +2986,6 @@ extension MyAppsViewController: UIDocumentPickerDelegate
     {
         guard let fileURL = urls.first else { return }
 
-        if isImportingRemotePairingFile {
-            isImportingRemotePairingFile = false
-            do {
-                let pairing = try PairingFileManager.shared.importRemotePairingFile(from: fileURL)
-                CommandTargetManager.shared.startDiscovery()
-                rebuildCommandTargetMenu()
-                let toast = ToastView(
-                    text: NSLocalizedString("Device Pairing File Added", comment: ""),
-                    detailText: String(
-                        format: NSLocalizedString("%@ was stored separately. It will appear as soon as its device is reachable nearby.", comment: ""),
-                        pairing.displayName
-                    )
-                )
-                toast.show(in: self.view)
-            } catch {
-                let alert = UIAlertController(
-                    title: NSLocalizedString("Unable to Add Device", comment: ""),
-                    message: error.localizedDescription,
-                    preferredStyle: .alert
-                )
-                alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
-                present(alert, animated: true)
-            }
-            return
-        }
-        
         InstallAppDialog.present(ipaURL: fileURL, from: self) { [weak self] in
             self?.sideloadApp(at: fileURL) { (result) in
                 debugLog("Sideloaded app at \(fileURL) with result: \(result)")
@@ -3068,9 +2993,6 @@ extension MyAppsViewController: UIDocumentPickerDelegate
         }
     }
 
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        isImportingRemotePairingFile = false
-    }
 }
 #endif
 

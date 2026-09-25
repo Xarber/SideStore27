@@ -102,8 +102,10 @@ final class WirelessPairViewModel: ObservableObject {
     @Published var isShareSheetPresented = false   
     
     private let pairingServiceTypes = [
-        "_remotepairing-manual-pairing._tcp",
-        "_remotepairing-pairable-host._tcp"
+        // A pairable-host advertisement is another computer/app waiting for
+        // an iOS device to connect to it. Treating it as the target produces
+        // an immediate EOF because both peers are acting as the host.
+        "_remotepairing-manual-pairing._tcp"
     ]
     
     private let bonjour = BonjourDiscoveryManager.shared
@@ -302,8 +304,13 @@ final class WirelessPairViewModel: ObservableObject {
         if dialogMode == .client {
             switch selectedOption {
             case .discovered(let target):
-                let targetIp = target.ipv4 ?? target.ipv6 ?? target.service.name
-                let targetPort = target.port > 0 ? target.port : AppConstants.Minimuxer.remotePairingPort
+                guard let targetIp = target.ipv4 ?? target.ipv6, target.port > 0 else {
+                    errorMessage = "The selected device did not publish a reachable network address. Refresh while its pairing screen remains open."
+                    statusText = "Device Unreachable"
+                    subStatusText = "SideStore will not use a device identifier as a network address."
+                    return
+                }
+                let targetPort = target.port
                 debugLog("[WirelessPairViewModel] confirmSelection -> Connecting to target '\(target.name)' at \(targetIp):\(targetPort)")
                 triggerPairing(targetIp: targetIp, targetPort: targetPort, targetName: target.name)
             case .configuredFallback:
