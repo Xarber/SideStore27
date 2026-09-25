@@ -1271,7 +1271,7 @@ enum RemoteDeviceOperations {
     }
 
     static func debugApp(_ bundleID: String) async throws {
-        try await command("sideStoreDebugApp", fields: ["bundleId": bundleID], timeout: 60) {
+        try await command("sideStoreDebugApp", fields: ["bundleId": bundleID], timeout: 90) {
             try await minimuxer.core.debugApp(appId: bundleID)
         }
     }
