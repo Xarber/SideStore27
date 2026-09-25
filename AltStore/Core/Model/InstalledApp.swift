@@ -145,6 +145,9 @@ public class InstalledApp: BaseEntity, InstalledAppProtocol
     @NSManaged public var storeBuildVersion: String?
     @NSManaged public var certificateStatusRaw: String?
     @NSManaged public var appBundleFingerprint: String?
+
+    // An app found on a selected device without a package managed by this installation.
+    public var isDiscoveredRemoteApp: Bool { certificateStatusRaw == "remoteDiscovered" }
     
     public var certificateStatus: CertificateStatus {
         get {

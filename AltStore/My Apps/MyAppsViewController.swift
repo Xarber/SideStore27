@@ -539,6 +539,12 @@ private extension MyAppsViewController {
                     }
                     guard !Task.isCancelled,
                           CommandTargetManager.shared.selectedTarget.id == target.id else { return }
+                    do {
+                        try self.recordDiscoveredRemoteApps(apps, profiles: profiles)
+                    } catch {
+                        ToastView(error: error).show(in: self)
+                        return
+                    }
                     self.visibleRemoteAppIDs = installedIDs
                     self.remoteProfileExpirations = profiles
                     let versions = Dictionary(apps.map { ($0.bundleId, $0.version) }, uniquingKeysWith: { first, _ in first })
@@ -555,6 +561,58 @@ private extension MyAppsViewController {
                 ToastView(error: error).show(in: self)
             }
         }
+    }
+
+    private func recordDiscoveredRemoteApps(_ apps: [RemoteDeviceOperations.InstalledApplication], profiles: [String: Date]) throws {
+        let context = DatabaseManager.shared.viewContext
+        let knownIDs = Set(InstalledApp.all(in: context).map(\.resignedBundleIdentifier))
+        var addedIDs = Set<String>()
+        for app in apps where profiles[app.bundleId] != nil &&
+            !knownIDs.contains(app.bundleId) && addedIDs.insert(app.bundleId).inserted {
+            // Provisioned apps are sideloaded; ordinary App Store apps are not
+            // imported into SideStore's managed-app database.
+            let discovered = NSEntityDescription.insertNewObject(
+                forEntityName: "InstalledApp", into: context
+            ) as! InstalledApp
+            discovered.name = app.name.isEmpty ? app.bundleId : app.name
+            discovered.bundleIdentifier = app.bundleId
+            discovered.resignedBundleIdentifier = app.bundleId
+            discovered.version = app.version
+            discovered.buildVersion = app.buildVersion.isEmpty ? app.version : app.buildVersion
+            discovered.installedDate = Date()
+            discovered.refreshedDate = Date()
+            discovered.expirationDate = profiles[app.bundleId] ?? .distantPast
+            discovered.isActive = false // Never treat another device's app as local.
+            discovered.hasAlternateIcon = false
+            discovered.useMainProfile = false
+            discovered.certificateStatusRaw = "remoteDiscovered"
+        }
+        if context.hasChanges { try context.save() }
+    }
+
+    private func offerPackageForDiscoveredApp(_ app: InstalledApp) {
+        let alert = UIAlertController(
+            title: app.name,
+            message: "This app was found on the selected device, but this SideStore does not have its IPA. Choose its source or import an IPA to sign and install it on that device.",
+            preferredStyle: .alert
+        )
+        if let sourceApp = StoreApp.first(
+            satisfying: NSPredicate(format: "%K == %@", #keyPath(StoreApp.bundleIdentifier), app.bundleIdentifier),
+            in: DatabaseManager.shared.viewContext
+        ) {
+            alert.addAction(UIAlertAction(title: "Install from Source", style: .default) { [weak self] _ in
+                self?.reinstallFromSource(sourceApp)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Import IPA", style: .default) { [weak self] _ in
+            #if !os(tvOS)
+            self?.presentDocumentPicker()
+            #else
+            self?.presentTVWebTransfer()
+            #endif
+        })
+        alert.addAction(.cancel)
+        present(alert, animated: true)
     }
 
     private func loadRemoteProfileExpirations(for target: CommandTarget) async throws -> [String: Date] {
@@ -815,6 +873,9 @@ private extension MyAppsViewController
                 for: installedApp,
                 expirationDate: self.remoteProfileExpirations?[installedApp.resignedBundleIdentifier]
             )
+            if installedApp.isDiscoveredRemoteApp {
+                cell.bannerView.button.setTitle("IMPORT IPA", for: .normal)
+            }
             cell.bannerView.button.isIndicatingActivity = false
             cell.bannerView.configure(for: installedApp, action: .custom(cell.bannerView.button.title(for: .normal) ?? ""))
             
@@ -834,7 +895,9 @@ private extension MyAppsViewController
             cell.bannerView.button.removeTarget(self, action: nil, for: .primaryActionTriggered)
             cell.bannerView.button.addTarget(self, action: #selector(MyAppsViewController.refreshApp(_:)), for: .primaryActionTriggered)
             
-            cell.bannerView.button.accessibilityLabel = String(format: NSLocalizedString("Refresh %@", comment: ""), installedApp.name)
+            cell.bannerView.button.accessibilityLabel = installedApp.isDiscoveredRemoteApp
+                ? "Import IPA for \(installedApp.name)"
+                : String(format: NSLocalizedString("Refresh %@", comment: ""), installedApp.name)
             
             if let storeApp = installedApp.storeApp, storeApp.isPledgeRequired, !storeApp.isPledged
             {
@@ -1165,6 +1228,10 @@ private extension MyAppsViewController
         guard let indexPath = self.collectionView.indexPathForItem(at: point) else { return }
         
         let installedApp = self.dataSource.item(at: indexPath)
+        if installedApp.isDiscoveredRemoteApp {
+            offerPackageForDiscoveredApp(installedApp)
+            return
+        }
         self.refresh(installedApp)
     }
     
@@ -1175,7 +1242,7 @@ private extension MyAppsViewController
             if let remoteIDs = self.visibleRemoteAppIDs {
                 let activeIDs = Set(self.remoteProfileExpirations?.keys.map { $0 } ?? [])
                 installedApps = InstalledApp.all(in: DatabaseManager.shared.viewContext)
-                    .filter { remoteIDs.contains($0.resignedBundleIdentifier)
+                    .filter { !$0.isDiscoveredRemoteApp && remoteIDs.contains($0.resignedBundleIdentifier)
                         && activeIDs.contains($0.resignedBundleIdentifier) }
                     .sorted { $0.bundleIdentifier == StoreApp.altstoreAppID ? false :
                               $1.bundleIdentifier == StoreApp.altstoreAppID ? true :
@@ -1361,6 +1428,10 @@ private extension MyAppsViewController
         guard let indexPath = self.collectionView.indexPathForItem(at: point) else { return }
         
         let installedApp = self.dataSource.item(at: indexPath)
+        if installedApp.isDiscoveredRemoteApp {
+            offerPackageForDiscoveredApp(installedApp)
+            return
+        }
         self.activate(installedApp)
     }
     
@@ -1478,6 +1549,10 @@ private extension MyAppsViewController
     
     func refresh(_ installedApp: InstalledApp)
     {
+        if installedApp.isDiscoveredRemoteApp {
+            offerPackageForDiscoveredApp(installedApp)
+            return
+        }
         Task { @MainActor in
             let previousProgress = AppManager.shared.refreshProgress(for: installedApp)
             guard previousProgress == nil else { return }
@@ -1595,19 +1670,24 @@ private extension MyAppsViewController
     
     func activate(_ installedApp: InstalledApp)
     {
+        if installedApp.isDiscoveredRemoteApp {
+            offerPackageForDiscoveredApp(installedApp)
+            return
+        }
         Task { @MainActor in
+            let isLocalTarget = CommandTargetManager.shared.selectedTarget.kind == .local
             func finish(_ result: Result<InstalledApp, Error>)
             {
                 do
                 {
                     let app = try result.get()
-                    if CommandTargetManager.shared.selectedTarget.kind == .local {
+                    if isLocalTarget {
                         app.managedObjectContext?.perform {
                             app.isActive = true
                             try? app.managedObjectContext?.save()
                         }
                     } else {
-                        self.reloadInstalledApps()
+                        Task { @MainActor in self.reloadInstalledApps() }
                     }
                 }
                 catch is CancellationError
@@ -2443,6 +2523,28 @@ extension MyAppsViewController
         let isActiveOnTarget = remoteProfileExpirations.map {
             $0[installedApp.resignedBundleIdentifier] != nil
         } ?? installedApp.isActive
+        if installedApp.isDiscoveredRemoteApp {
+            let packageAction = UIAction(title: "Import IPA or Source", image: UIImage(systemName: "square.and.arrow.down")) { [weak self] _ in
+                self?.offerPackageForDiscoveredApp(installedApp)
+            }
+            let infoAction = UIAction(title: NSLocalizedString("Info", comment: ""), image: UIImage(systemName: "info.circle")) { [weak self] _ in
+                self?.showAppInfo(installedApp)
+            }
+            var actions: [UIMenuElement] = [packageAction]
+            if isActiveOnTarget {
+                actions.append(UIAction(title: NSLocalizedString("Enable JIT", comment: ""), image: UIImage(systemName: "bolt")) { [weak self] _ in
+                    self?.enableJIT(for: installedApp)
+                })
+                actions.append(UIAction(title: NSLocalizedString("Deactivate", comment: ""), image: UIImage(systemName: "xmark.circle")) { [weak self] _ in
+                    self?.deactivate(installedApp)
+                })
+            }
+            actions.append(UIAction(title: NSLocalizedString("Delete App", comment: ""), image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
+                self?.deleteApp(installedApp)
+            })
+            actions.append(infoAction)
+            return UIMenu(children: actions)
+        }
         var actions = [UIMenuElement]()
         
         let openAction = UIAction(title: NSLocalizedString("Open", comment: ""), image: UIImage(systemName: "arrow.up.forward.app")) { (action) in
