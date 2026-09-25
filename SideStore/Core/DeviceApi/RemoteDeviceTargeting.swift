@@ -15,6 +15,108 @@ import Network
 import SideSign
 import UIKit
 
+private struct ResolvedNearbyService: Equatable {
+    let id: String
+    let name: String
+    let type: String
+    let host: String
+    let port: UInt16
+    let txt: [String: String]
+}
+
+/// Uses the same Foundation Bonjour path as StikDebug. NWBrowser is retained
+/// elsewhere for the generic discovery inspector, but it does not consistently
+/// publish iOS remote-pairing services inside SideStore/LiveContainer.
+private final class NearbyTargetBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+    var didUpdate: (([ResolvedNearbyService]) -> Void)?
+
+    private let browser = NetServiceBrowser()
+    private var services: [String: NetService] = [:]
+    private var resolved: [String: ResolvedNearbyService] = [:]
+    private(set) var isSearching = false
+
+    override init() {
+        super.init()
+        browser.delegate = self
+    }
+
+    func start() {
+        guard !isSearching else { return }
+        isSearching = true
+        browser.searchForServices(ofType: "_remotepairing._tcp.", inDomain: "local.")
+    }
+
+    func refresh() {
+        stop()
+        services.removeAll()
+        resolved.removeAll()
+        didUpdate?([])
+        start()
+    }
+
+    func stop() {
+        browser.stop()
+        isSearching = false
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        let id = serviceID(service)
+        services[id] = service
+        service.delegate = self
+        service.resolve(withTimeout: 8)
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
+        let id = serviceID(service)
+        services[id] = nil
+        resolved[id] = nil
+        publish()
+    }
+
+    func netServiceBrowserDidStopSearch(_ browser: NetServiceBrowser) {
+        isSearching = false
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
+        isSearching = false
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        let id = serviceID(sender)
+        var txt: [String: String] = [:]
+        if let data = sender.txtRecordData() {
+            for (key, value) in NetService.dictionary(fromTXTRecord: data) {
+                txt[key.lowercased()] = String(data: value, encoding: .utf8) ?? ""
+            }
+        }
+        let addresses = BonjourDiscoveryManager.addressesFromNetService(sender)
+        let hostname = (sender.hostName ?? sender.name)
+            .replacingOccurrences(of: ".local.", with: "")
+            .replacingOccurrences(of: ".local", with: "")
+        let host = addresses.first(where: { !$0.contains(":") }) ?? addresses.first ?? hostname
+        resolved[id] = ResolvedNearbyService(
+            id: id,
+            name: sender.name,
+            type: sender.type,
+            host: host,
+            port: UInt16(clamping: sender.port),
+            txt: txt
+        )
+        publish()
+    }
+
+    private func serviceID(_ service: NetService) -> String {
+        "\(service.domain)/\(service.type)/\(service.name)"
+    }
+
+    private func publish() {
+        let values = resolved.values.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        DispatchQueue.main.async { [weak self] in self?.didUpdate?(values) }
+    }
+}
+
 enum CommandTargetKind: String, Codable, Sendable {
     case local
     case nearby
@@ -82,17 +184,19 @@ final class CommandTargetManager: ObservableObject {
     private let selectedTargetKey = "SelectedCommandTarget"
     private var cancellables = Set<AnyCancellable>()
     private var resolutionTasks: [String: Task<Void, Never>] = [:]
+    private lazy var nearbyBrowser: NearbyTargetBrowser = {
+        let browser = NearbyTargetBrowser()
+        browser.didUpdate = { [weak self] services in
+            self?.updateNearbyTargets(fromResolvedServices: services)
+        }
+        return browser
+    }()
 
     private init() {
         // A relaunch always returns to the safe, ordinary SideStore workflow.
         // Remote choices remain explicit for each app session.
         selectedTarget = .local
         UserDefaults.standard.removeObject(forKey: selectedTargetKey)
-
-        BonjourDiscoveryManager.shared.$instances
-            .receive(on: RunLoop.main)
-            .sink { [weak self] services in self?.updateNearbyTargets(from: services) }
-            .store(in: &cancellables)
 
         StikServerDeviceConnection.shared.$devices
             .receive(on: RunLoop.main)
@@ -115,20 +219,55 @@ final class CommandTargetManager: ObservableObject {
 
     func startDiscovery() {
         isDiscovering = true
-        BonjourDiscoveryManager.shared.discoverInstances(
-            // CoreDevice remote pairing is the supported network path on modern
-            // iOS. _apple-mobdev2 also exposes this device's loopback lockdown
-            // service, which made the local UDID look like a remote IP address.
-            ofTypes: ["_remotepairing._tcp."],
-            clearExisting: true
-        )
+        nearbyBrowser.refresh()
     }
 
     func stopDiscovery() {
         isDiscovering = false
-        BonjourDiscoveryManager.shared.stopInstanceSearch()
+        nearbyBrowser.stop()
         resolutionTasks.values.forEach { $0.cancel() }
         resolutionTasks.removeAll()
+    }
+
+    private func updateNearbyTargets(fromResolvedServices services: [ResolvedNearbyService]) {
+        let pairings = PairingFileManager.shared.remotePairingFiles().filter { $0.mode == .rppairing }
+        let targets = services.map { service -> CommandTarget in
+            let identifiers = [service.txt["identifier"], service.txt["uuid"], service.txt["deviceid"], service.txt["udid"]]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let serviceIdentifier = identifiers.first ?? service.name
+            let advertisedName = service.txt["name"] ?? service.txt["devicename"] ?? service.name
+            let normalizedName = Self.normalizedDeviceName(advertisedName)
+            let pairing = pairings.first(where: {
+                $0.serviceIdentifier?.caseInsensitiveCompare(service.id) == .orderedSame
+                    || $0.serviceIdentifier?.caseInsensitiveCompare(serviceIdentifier) == .orderedSame
+            }) ?? pairings.first(where: {
+                Self.normalizedDeviceName($0.displayName) == normalizedName
+            })
+            return CommandTarget(
+                id: "nearby|\(serviceIdentifier.lowercased())",
+                name: service.txt["name"] ?? service.txt["devicename"] ?? pairing?.displayName ?? service.name,
+                kind: .nearby,
+                deviceKind: service.txt["model"] ?? service.txt["modelidentifier"] ?? service.txt["deviceclass"] ?? pairing?.modelIdentifier,
+                pairingIdentifier: pairing?.deviceIdentifier ?? identifiers.first,
+                advertisedServiceIdentifier: serviceIdentifier,
+                discoveryServiceID: service.id,
+                discoveryServiceType: service.type,
+                host: service.host,
+                port: service.port,
+                pairingFilePath: pairing?.url.path
+            )
+        }
+        let oldTargets = nearbyTargets
+        nearbyTargets = targets
+        isDiscovering = nearbyBrowser.isSearching
+        if let refreshed = targets.first(where: { $0.id == selectedTarget.id }), refreshed != selectedTarget {
+            select(refreshed)
+        }
+        if oldTargets != targets {
+            NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
+            updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+        }
     }
 
     func connectStikServer(address: String, token: String) {
@@ -948,6 +1087,14 @@ enum StikServerRequestError: LocalizedError {
 }
 
 enum RemoteDeviceOperations {
+    struct InstalledApplication: Codable, Identifiable, Sendable {
+        var id: String { bundleId }
+        let bundleId: String
+        let name: String
+        let version: String
+        let buildVersion: String
+    }
+
     struct HealthStatus: Sendable {
         let reachable: Bool
         let pairingLoaded: Bool
@@ -976,6 +1123,22 @@ enum RemoteDeviceOperations {
             throw RemoteDeviceError.invalidRelayResponse("missing device identifier")
         }
         return udid
+    }
+
+    static func listApps() async throws -> [InstalledApplication] {
+        let target = DeviceOperationScope.target
+        guard target.kind == .stikServer else { throw RemoteDeviceError.unsupportedRelay }
+        let response = try await StikServerDeviceConnection.shared.request(
+            "sideStoreListApps", target: target, fields: [:], timeout: 60
+        )
+        guard let raw = response["apps"],
+              let data = try? JSONSerialization.data(withJSONObject: raw),
+              let apps = try? JSONDecoder().decode([InstalledApplication].self, from: data) else {
+            throw RemoteDeviceError.invalidRelayResponse("missing installed application list")
+        }
+        return apps.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
     }
 
     static func healthCheck() async throws -> HealthStatus {
@@ -1474,6 +1637,8 @@ final class SideStoreRelayAgent {
             return values
         case "sideStoreUDID":
             return ["udid": try await minimuxer.core.fetchUDID()]
+        case "sideStoreListApps":
+            throw RemoteDeviceError.unsupportedRelay
         case "sideStoreInstallProfile":
             guard let encoded = object["data"] as? String, let data = Data(base64Encoded: encoded) else {
                 throw RemoteDeviceError.invalidRelayResponse("missing profile data")

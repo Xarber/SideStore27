@@ -68,6 +68,7 @@ class MyAppsViewController: UICollectionViewController
     private var commandTargetButton: UIBarButtonItem?
     private var commandTargetObservers: [NSObjectProtocol] = []
     private var isManagingSigningAccounts = false
+    private var remoteAppsViewController: UIViewController?
     
     // Cache
     private var cachedUpdateSizes = [String: CGSize]()
@@ -200,6 +201,7 @@ class MyAppsViewController: UICollectionViewController
 
         CommandTargetManager.shared.startDiscovery()
         rebuildCommandTargetMenu()
+        updateRemoteAppsPresentation()
 
         if let pendingURL = self.pendingImportURL {
             self.pendingImportURL = nil
@@ -351,6 +353,7 @@ private extension MyAppsViewController {
         commandTargetObservers = [
             NotificationCenter.default.addObserver(forName: .commandTargetDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
+                self?.updateRemoteAppsPresentation()
             },
             NotificationCenter.default.addObserver(forName: .commandTargetsDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
@@ -448,6 +451,30 @@ private extension MyAppsViewController {
         let controller = UIHostingController(rootView: DeviceCenterView())
         controller.title = NSLocalizedString("Devices", comment: "")
         navigationController?.pushViewController(controller, animated: true)
+    }
+
+    func updateRemoteAppsPresentation() {
+        let target = CommandTargetManager.shared.selectedTarget
+        remoteAppsViewController?.willMove(toParent: nil)
+        remoteAppsViewController?.view.removeFromSuperview()
+        remoteAppsViewController?.removeFromParent()
+        remoteAppsViewController = nil
+        collectionView.isHidden = false
+
+        guard target.kind == .stikServer else { return }
+        let controller = UIHostingController(rootView: RemoteInstalledAppsView(target: target))
+        addChild(controller)
+        controller.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(controller.view)
+        NSLayoutConstraint.activate([
+            controller.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            controller.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            controller.view.topAnchor.constraint(equalTo: view.topAnchor),
+            controller.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        controller.didMove(toParent: self)
+        collectionView.isHidden = true
+        remoteAppsViewController = controller
     }
 
     func addSigningAccount() {

@@ -8,6 +8,12 @@ import SwiftUI
 #if !os(tvOS)
 @MainActor
 struct DeviceCenterView: View {
+    private struct SigningAccountOption: Identifiable {
+        let id: String
+        let appleID: String
+        let isActive: Bool
+    }
+
     @StateObject private var targets = CommandTargetManager.shared
     @StateObject private var stikServer = StikServerDeviceConnection.shared
 
@@ -16,12 +22,15 @@ struct DeviceCenterView: View {
     @State private var importTarget: CommandTarget?
     @State private var isImportingPairing = false
     @State private var alertMessage: String?
+    @State private var signingAccounts: [SigningAccountOption] = []
+    @State private var isManagingAccounts = false
 
     var body: some View {
         List {
             selectedSection
             nearbySection
             stikServerSection
+            signingAccountSection
             pairingSection
         }
         .listStyle(.insetGrouped)
@@ -37,7 +46,10 @@ struct DeviceCenterView: View {
                 .accessibilityLabel("Refresh Devices")
             }
         }
-        .onAppear { targets.startDiscovery() }
+        .onAppear {
+            targets.startDiscovery()
+            Task { await loadSigningAccounts() }
+        }
         .onDisappear { targets.stopDiscovery() }
         .fileImporter(
             isPresented: $isImportingPairing,
@@ -156,6 +168,41 @@ struct DeviceCenterView: View {
         }
     }
 
+    private var signingAccountSection: some View {
+        Section {
+            ForEach(signingAccounts) { account in
+                SwiftUI.Button {
+                    Task { await activateSigningAccount(account) }
+                } label: {
+                    HStack {
+                        Label(account.appleID, systemImage: "person.crop.circle")
+                        Spacer()
+                        if account.isActive {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                }
+                .disabled(isManagingAccounts || account.isActive)
+            }
+
+            SwiftUI.Button {
+                Task { await addSigningAccount() }
+            } label: {
+                HStack {
+                    Label("Add Apple ID", systemImage: "person.badge.plus")
+                    Spacer()
+                    if isManagingAccounts { ProgressView() }
+                }
+            }
+            .disabled(isManagingAccounts)
+        } header: {
+            Text("Signing Apple ID")
+        } footer: {
+            Text("The signing account is independent from the selected device. Tap and hold the toolbar device button to switch either one quickly.")
+        }
+    }
+
     @ViewBuilder
     private func deviceRow(_ target: CommandTarget, selectable: Bool) -> some View {
         SwiftUI.Button {
@@ -217,6 +264,50 @@ struct DeviceCenterView: View {
         Keychain.shared.stikServerAccessToken = token
         serverToken = token
         targets.connectStikServer(address: address, token: token)
+    }
+
+    private func loadSigningAccounts() async {
+        await AccountCredentialStore.shared.captureActiveAccount()
+        signingAccounts = await AccountCredentialStore.shared.availableAccounts().map {
+            SigningAccountOption(id: $0.identifier, appleID: $0.appleID, isActive: $0.isActive)
+        }
+    }
+
+    private func activateSigningAccount(_ account: SigningAccountOption) async {
+        isManagingAccounts = true
+        defer { isManagingAccounts = false }
+        do {
+            try await AccountCredentialStore.shared.activate(identifier: account.id)
+            await loadSigningAccounts()
+        } catch {
+            alertMessage = "Unable to switch Apple ID: \(error.localizedDescription)"
+        }
+    }
+
+    private func addSigningAccount() async {
+        guard let presenter = UIApplication.shared.topViewController() else {
+            alertMessage = "Unable to present Apple ID sign in."
+            return
+        }
+        isManagingAccounts = true
+        defer { isManagingAccounts = false }
+        let previousAccount = signingAccounts.first(where: \.isActive)?.id
+        do {
+            let result = try await AuthManager.shared.signIn(
+                presentingViewController: presenter,
+                skipResign: true,
+                skipHowTos: true,
+                commandTarget: targets.selectedTarget
+            )
+            let identifier = result.team.account?.identifier ?? result.team.identifier
+            AccountCredentialStore.shared.captureCurrentAccount(identifier: identifier)
+            await loadSigningAccounts()
+        } catch is CancellationError {
+            if let previousAccount { try? await AccountCredentialStore.shared.activate(identifier: previousAccount) }
+        } catch {
+            if let previousAccount { try? await AccountCredentialStore.shared.activate(identifier: previousAccount) }
+            alertMessage = "Unable to add Apple ID: \(error.localizedDescription)"
+        }
     }
 
     private func handlePairingImport(_ result: Result<[URL], Error>) {
