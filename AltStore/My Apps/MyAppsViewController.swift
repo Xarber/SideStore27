@@ -169,6 +169,7 @@ class MyAppsViewController: UICollectionViewController
         }
 
         self.configureCommandTargetPicker()
+        self.applyInstalledAppScope()
     }
     
     override func viewIsAppearing(_ animated: Bool)
