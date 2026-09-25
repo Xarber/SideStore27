@@ -237,16 +237,16 @@ class PillButton: UIButton
 }
 
 extension PillButton {
-    func configure(for installedApp: InstalledApp) {
+    func configure(for installedApp: InstalledApp, expirationDate remoteExpirationDate: Date? = nil) {
         let currentDate = Date()
-        let expirationDate = installedApp.expirationDate
+        let expirationDate = remoteExpirationDate ?? installedApp.expirationDate
         let isExpired = currentDate > expirationDate
         
         // verboseLog("[PillButton] configure for app '\(installedApp.name)': status=\(installedApp.certificateStatus), certSerial=\(installedApp.certificateSerialNumber ?? "nil"), isExpired=\(isExpired)")
         
-        if installedApp.certificateStatus == .revoked {
+        if remoteExpirationDate == nil && installedApp.certificateStatus == .revoked {
             self.setDisplayState(.revoked)
-        } else if isExpired || installedApp.certificateStatus == .expired {
+        } else if isExpired || (remoteExpirationDate == nil && installedApp.certificateStatus == .expired) {
             self.setDisplayState(.expired)
         } else {
             let formatter = DateComponentsFormatter()

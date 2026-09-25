@@ -68,7 +68,12 @@ class MyAppsViewController: UICollectionViewController
     private var commandTargetButton: UIBarButtonItem?
     private var commandTargetObservers: [NSObjectProtocol] = []
     private var isManagingSigningAccounts = false
-    private var remoteAppsViewController: UIViewController?
+    private var visibleRemoteAppIDs: Set<String>?
+    private var visibleLocalAppIDs: Set<String>? = []
+    private var remoteProfileExpirations: [String: Date]?
+    private var remoteUpdateAppIDs: Set<String>?
+    private var installedAppsReloadTask: Task<Void, Never>?
+    private var presentedTargetID: String?
     
     // Cache
     private var cachedUpdateSizes = [String: CGSize]()
@@ -89,6 +94,7 @@ class MyAppsViewController: UICollectionViewController
             minimuxerStatusCheckTask?.cancel()
         }
         commandTargetObservers.forEach(NotificationCenter.default.removeObserver)
+        installedAppsReloadTask?.cancel()
     }
     
     override func viewDidLoad()
@@ -455,35 +461,135 @@ private extension MyAppsViewController {
 
     func updateRemoteAppsPresentation() {
         let target = CommandTargetManager.shared.selectedTarget
-        remoteAppsViewController?.willMove(toParent: nil)
-        remoteAppsViewController?.view.removeFromSuperview()
-        remoteAppsViewController?.removeFromParent()
-        remoteAppsViewController = nil
-        collectionView.isHidden = false
+        navigationItem.title = target.kind == .local ? NSLocalizedString("My Apps", comment: "") : "\(target.name)'s Apps"
+        if presentedTargetID == target.id {
+            reloadInstalledApps()
+            return
+        }
+        presentedTargetID = target.id
+        // Keep the original collection view, sections, cells and actions for
+        // every target. Never leave the previous device's apps visible while
+        // the newly selected device is being queried.
+        visibleRemoteAppIDs = target.kind == .local ? nil : []
+        visibleLocalAppIDs = target.kind == .local ? [] : nil
+        remoteProfileExpirations = nil
+        remoteUpdateAppIDs = target.kind == .local ? nil : []
+        applyInstalledAppScope()
+        reloadInstalledApps()
+    }
 
-        navigationItem.title = target.kind == .stikServer ? "\(target.name)'s Apps" : NSLocalizedString("My Apps", comment: "")
-        guard target.kind == .stikServer else { return }
-        let controller = UIHostingController(rootView: RemoteInstalledAppsView(target: target) { [weak self] bundleID, completion in
-            guard let self,
-                  let app = InstalledApp.all(in: DatabaseManager.shared.viewContext)
-                    .first(where: { $0.resignedBundleIdentifier == bundleID }) else {
-                completion()
-                return
+    private func applyInstalledAppScope() {
+        let targetPredicate = (visibleRemoteAppIDs ?? visibleLocalAppIDs).map {
+            $0.isEmpty ? NSPredicate(value: false) :
+                NSPredicate(format: "%K IN %@", #keyPath(InstalledApp.resignedBundleIdentifier), Array($0))
+        }
+        let activePredicate: NSPredicate = remoteProfileExpirations.map {
+            $0.isEmpty ? NSPredicate(value: false) :
+                NSPredicate(format: "%K IN %@", #keyPath(InstalledApp.resignedBundleIdentifier), Array($0.keys))
+        } ?? NSPredicate(format: "%K == YES", #keyPath(InstalledApp.isActive))
+        let inactivePredicate: NSPredicate = remoteProfileExpirations.map { profiles in
+            let inactive = (visibleRemoteAppIDs ?? []).subtracting(profiles.keys)
+            return inactive.isEmpty ? NSPredicate(value: false) :
+                NSPredicate(format: "%K IN %@", #keyPath(InstalledApp.resignedBundleIdentifier), Array(inactive))
+        } ?? NSPredicate(format: "%K == NO", #keyPath(InstalledApp.isActive))
+        let updatePredicate: NSPredicate = remoteUpdateAppIDs.map {
+            $0.isEmpty ? NSPredicate(value: false) :
+                NSPredicate(format: "%K IN %@", #keyPath(InstalledApp.resignedBundleIdentifier), Array($0))
+        } ?? InstalledApp.supportedUpdatesFetchRequest().predicate!
+        let requests: [(NSFetchedResultsController<InstalledApp>, NSPredicate?)] = [
+            (updatesDataSource.fetchedResultsController, updatePredicate),
+            (activeAppsDataSource.fetchedResultsController, activePredicate),
+            (inactiveAppsDataSource.fetchedResultsController, inactivePredicate)
+        ]
+        for (controller, base) in requests {
+            let predicates = [base, targetPredicate].compactMap { $0 }
+            controller.fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
+            try? controller.performFetch()
+        }
+        collectionView.reloadData()
+    }
+
+    private func reloadInstalledApps(completion: (() -> Void)? = nil) {
+        installedAppsReloadTask?.cancel()
+        let target = CommandTargetManager.shared.selectedTarget
+        installedAppsReloadTask = Task { [weak self] in
+            defer { completion?() }
+            do {
+                let apps = try await DeviceOperationSession.run(target: target) {
+                    try await RemoteDeviceOperations.listApps()
+                }
+                guard !Task.isCancelled, let self,
+                      CommandTargetManager.shared.selectedTarget.id == target.id else { return }
+                let installedIDs = Set(apps.map(\.bundleId))
+                if target.kind == .local {
+                    guard !installedIDs.isEmpty else {
+                        throw RemoteDeviceError.invalidRelayResponse("device returned no installed apps")
+                    }
+                    // A remote install can have a managed record here too.
+                    // Filter the live view instead of deleting that record.
+                    self.visibleLocalAppIDs = installedIDs
+                } else {
+                    let profiles: [String: Date]
+                    do {
+                        profiles = try await self.loadRemoteProfileExpirations(for: target)
+                    } catch {
+                        ToastView(error: error).show(in: self)
+                        return
+                    }
+                    guard !Task.isCancelled,
+                          CommandTargetManager.shared.selectedTarget.id == target.id else { return }
+                    self.visibleRemoteAppIDs = installedIDs
+                    self.remoteProfileExpirations = profiles
+                    let versions = Dictionary(apps.map { ($0.bundleId, $0.version) }, uniquingKeysWith: { first, _ in first })
+                    self.remoteUpdateAppIDs = Set(InstalledApp.all(in: DatabaseManager.shared.viewContext)
+                        .filter { app in
+                            profiles[app.resignedBundleIdentifier] != nil &&
+                                versions[app.resignedBundleIdentifier].map { self.hasRemoteUpdate(app, installedVersion: $0) } == true
+                        }
+                        .map(\.resignedBundleIdentifier))
+                }
+                self.applyInstalledAppScope()
+            } catch {
+                guard let self else { return }
+                ToastView(error: error).show(in: self)
             }
-            self.refresh([app]) { _ in completion() }
-        })
-        addChild(controller)
-        controller.view.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(controller.view)
-        NSLayoutConstraint.activate([
-            controller.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            controller.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            controller.view.topAnchor.constraint(equalTo: view.topAnchor),
-            controller.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
-        ])
-        controller.didMove(toParent: self)
-        collectionView.isHidden = true
-        remoteAppsViewController = controller
+        }
+    }
+
+    private func loadRemoteProfileExpirations(for target: CommandTarget) async throws -> [String: Date] {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SideStoreProfiles-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let path = try await DeviceOperationSession.run(target: target) {
+            try await RemoteDeviceOperations.dumpProfiles(to: temporary.path, mode: .raw)
+        }
+        guard !path.isEmpty else {
+            throw RemoteDeviceError.invalidRelayResponse("empty provisioning-profile export path")
+        }
+        let files = try FileManager.default.contentsOfDirectory(
+            at: URL(fileURLWithPath: path), includingPropertiesForKeys: nil
+        )
+        var expirations: [String: Date] = [:]
+        for file in files where file.pathExtension.lowercased() == "mobileprovision" {
+            guard let data = try? Data(contentsOf: file),
+                  let profile = try? ALTProvisioningProfile(data: data) else { continue }
+            if profile.expirationDate > (expirations[profile.bundleIdentifier] ?? .distantPast) {
+                expirations[profile.bundleIdentifier] = profile.expirationDate
+            }
+        }
+        return expirations
+    }
+
+    private func hasRemoteUpdate(_ installedApp: InstalledApp, installedVersion: String) -> Bool {
+        guard let storeApp = installedApp.storeApp,
+              let latest = storeApp.latestSupportedVersion,
+              !storeApp.isPledgeRequired || storeApp.isPledged else { return false }
+        guard let currentVersion = SemanticVersion(installedVersion),
+              let latestVersion = SemanticVersion(latest.version) else {
+            return installedVersion != latest.version
+        }
+        return latestVersion > currentVersion
     }
 
     func addSigningAccount() {
@@ -560,7 +666,7 @@ private extension MyAppsViewController
             
             cell.button.addTarget(self, action: #selector(MyAppsViewController.showHiddenUpdatesAlert(_:)), for: .primaryActionTriggered)
             
-            if !self.unsupportedUpdates.isEmpty
+            if CommandTargetManager.shared.selectedTarget.kind == .local && !self.unsupportedUpdates.isEmpty
             {
                 cell.textLabel.text = NSLocalizedString("Unsupported Updates Available", comment: "")
                 cell.button.isHidden = false
@@ -704,7 +810,10 @@ private extension MyAppsViewController
                 cell.deactivateBadge?.transform = CGAffineTransform.identity.scaledBy(x: 0.33, y: 0.33)
             }
             
-            cell.bannerView.button.configure(for: installedApp)
+            cell.bannerView.button.configure(
+                for: installedApp,
+                expirationDate: self.remoteProfileExpirations?[installedApp.resignedBundleIdentifier]
+            )
             cell.bannerView.button.isIndicatingActivity = false
             cell.bannerView.configure(for: installedApp, action: .custom(cell.bannerView.button.title(for: .normal) ?? ""))
             
@@ -716,8 +825,9 @@ private extension MyAppsViewController
             }
             
             let currentDate = Date()
-            let isExpired = currentDate > installedApp.expirationDate
-            cell.bannerView.buttonLabel.isHidden = isExpired || installedApp.certificateStatus == .revoked
+            let isExpired = currentDate > (self.remoteProfileExpirations?[installedApp.resignedBundleIdentifier] ?? installedApp.expirationDate)
+            cell.bannerView.buttonLabel.isHidden = isExpired ||
+                (self.remoteProfileExpirations == nil && installedApp.certificateStatus == .revoked)
             cell.bannerView.buttonLabel.text = NSLocalizedString("Expires in", comment: "")
             
             cell.bannerView.button.removeTarget(self, action: nil, for: .primaryActionTriggered)
@@ -963,6 +1073,7 @@ private extension MyAppsViewController
             }
             
             self.refreshGroup = nil
+            if self.visibleRemoteAppIDs != nil { self.reloadInstalledApps() }
             completionHandler(results)
         }
         
@@ -1059,7 +1170,20 @@ private extension MyAppsViewController
     @IBAction func refreshAllApps(_ sender: UIBarButtonItem)
     {
         Task { @MainActor in
-            let installedApps = InstalledApp.fetchAppsForRefreshingAll(in: DatabaseManager.shared.viewContext)
+            let installedApps: [InstalledApp]
+            if let remoteIDs = self.visibleRemoteAppIDs {
+                let activeIDs = Set(self.remoteProfileExpirations?.keys.map { $0 } ?? [])
+                installedApps = InstalledApp.all(in: DatabaseManager.shared.viewContext)
+                    .filter { remoteIDs.contains($0.resignedBundleIdentifier)
+                        && activeIDs.contains($0.resignedBundleIdentifier) }
+                    .sorted { $0.bundleIdentifier == StoreApp.altstoreAppID ? false :
+                              $1.bundleIdentifier == StoreApp.altstoreAppID ? true :
+                              (self.remoteProfileExpirations?[$0.resignedBundleIdentifier] ?? $0.expirationDate)
+                                < (self.remoteProfileExpirations?[$1.resignedBundleIdentifier] ?? $1.expirationDate) }
+            } else {
+                installedApps = InstalledApp.fetchAppsForRefreshingAll(in: DatabaseManager.shared.viewContext)
+                    .filter { self.visibleLocalAppIDs?.contains($0.resignedBundleIdentifier) ?? true }
+            }
             guard !installedApps.isEmpty else {
                 let error: Error
                 
@@ -1476,9 +1600,13 @@ private extension MyAppsViewController
                 do
                 {
                     let app = try result.get()
-                    app.managedObjectContext?.perform {
-                        app.isActive = true
-                        try? app.managedObjectContext?.save()
+                    if CommandTargetManager.shared.selectedTarget.kind == .local {
+                        app.managedObjectContext?.perform {
+                            app.isActive = true
+                            try? app.managedObjectContext?.save()
+                        }
+                    } else {
+                        self.reloadInstalledApps()
                     }
                 }
                 catch is CancellationError
@@ -1495,7 +1623,8 @@ private extension MyAppsViewController
                 }
             }
                     
-            if !UserDefaults.standard.isAppLimitDisabled && UserDefaults.standard.activeAppsLimit != nil
+            if CommandTargetManager.shared.selectedTarget.kind == .local &&
+                !UserDefaults.standard.isAppLimitDisabled && UserDefaults.standard.activeAppsLimit != nil
             {
                 self.promptToDeactivateApp(for: installedApp) { result in
                     installedApp.managedObjectContext?.perform {
@@ -1569,7 +1698,7 @@ private extension MyAppsViewController
     
     func deactivate(_ installedApp: InstalledApp, completionHandler: ((Result<InstalledApp, Error>) -> Void)? = nil)
     {
-        guard installedApp.isActive else { return }
+        guard CommandTargetManager.shared.selectedTarget.kind != .local || installedApp.isActive else { return }
         
         Task { @MainActor in
             AppManager.shared.deactivate(installedApp, presentingViewController: self) { (result) in
@@ -1579,6 +1708,7 @@ private extension MyAppsViewController
                     try? app.managedObjectContext?.save()
                     
                     debugLog("Finished deactivating app: \(app.bundleIdentifier)")
+                    if self.visibleRemoteAppIDs != nil { self.reloadInstalledApps() }
                 }
                 catch is CancellationError
                 {
@@ -1600,6 +1730,31 @@ private extension MyAppsViewController
     
     func deleteApp(_ installedApp: InstalledApp, completionHandler: ((Result<InstalledApp, Error>) -> Void)? = nil)
     {
+        let target = CommandTargetManager.shared.selectedTarget
+        if target.kind != .local {
+            let bundleID = installedApp.resignedBundleIdentifier
+            let title = String(format: NSLocalizedString("Delete “%@”?", comment: ""), installedApp.name)
+            let alert = UIAlertController(title: title,
+                message: "This removes the app from \(target.name), without changing this device's SideStore records.",
+                preferredStyle: .alert)
+            alert.addAction(.cancel)
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Delete", comment: ""), style: .destructive) { [weak self] _ in
+                Task { @MainActor in
+                    do {
+                        try await DeviceOperationSession.run(target: target) {
+                            try await RemoteDeviceOperations.removeApp(bundleID)
+                        }
+                        self?.reloadInstalledApps()
+                        completionHandler?(.success(installedApp))
+                    } catch {
+                        if let self { ToastView(error: error).show(in: self) }
+                        completionHandler?(.failure(error))
+                    }
+                }
+            })
+            present(alert, animated: true)
+            return
+        }
         guard installedApp.isActive else { return }
         
         let appName = installedApp.name
@@ -1684,6 +1839,10 @@ private extension MyAppsViewController
     
     func remove(_ installedApp: InstalledApp)
     {
+        if CommandTargetManager.shared.selectedTarget.kind != .local {
+            deleteApp(installedApp)
+            return
+        }
         let title = String(format: NSLocalizedString("Remove “%@” from SideStore?", comment: ""), installedApp.name)
         let message: String
         
@@ -1962,7 +2121,7 @@ private extension MyAppsViewController
     }
     
     func enableJIT(for installedApp: InstalledApp) {
-        AppManager.shared.enableJIT(for: installedApp) { result in
+        AppManager.shared.enableJIT(for: installedApp, target: CommandTargetManager.shared.selectedTarget) { result in
             DispatchQueue.main.async {
                 switch result {
                 case .success:
@@ -2016,8 +2175,14 @@ private extension MyAppsViewController
     #if !os(tvOS)
     @objc func checkForUpdates(_ sender: UIRefreshControl)
     {
+        var remaining = 2
+        let finished: () -> Void = {
+            remaining -= 1
+            if remaining == 0 { sender.endRefreshing() }
+        }
+        self.reloadInstalledApps(completion: finished)
         self.performCheckForUpdates {
-            sender.endRefreshing()
+            finished()
         }
     }
     #else
@@ -2029,7 +2194,7 @@ private extension MyAppsViewController
     
     private func performCheckForUpdates(completion: (() -> Void)? = nil)
     {
-        guard !self.isCheckingForUpdates else { return }
+        guard !self.isCheckingForUpdates else { completion?(); return }
         self.isCheckingForUpdates = true
         
         Task.detached {
@@ -2274,6 +2439,9 @@ extension MyAppsViewController
 {
     private func contextMenu(for installedApp: InstalledApp) -> UIMenu
     {
+        let isActiveOnTarget = remoteProfileExpirations.map {
+            $0[installedApp.resignedBundleIdentifier] != nil
+        } ?? installedApp.isActive
         var actions = [UIMenuElement]()
         
         let openAction = UIAction(title: NSLocalizedString("Open", comment: ""), image: UIImage(systemName: "arrow.up.forward.app")) { (action) in
@@ -2382,7 +2550,7 @@ extension MyAppsViewController
         
         var backupSubmenuActions = [UIMenuElement]()
         
-        if installedApp.isActive
+        if isActiveOnTarget
         {
             backupSubmenuActions.append(backupAction)
         }
@@ -2413,7 +2581,7 @@ extension MyAppsViewController
             {
                 backupSubmenuActions.append(exportBackupMenu)
                 
-                if installedApp.isActive
+                if isActiveOnTarget
                 {
                     backupSubmenuActions.append(restoreBackupAction)
                 }
@@ -2426,7 +2594,7 @@ extension MyAppsViewController
             }
         }
         
-        if installedApp.isActive
+        if isActiveOnTarget
         {
             // import backup into shared backups dir is allowed
             backupSubmenuActions.append(importBackupMenu)
@@ -2459,9 +2627,13 @@ extension MyAppsViewController
         }
         else
         {
-            if installedApp.isActive
+            if isActiveOnTarget
             {
-                actions.append(openMenu)
+                // Opening via a URL scheme would launch the app on this iPad,
+                // not on the selected device.
+                if CommandTargetManager.shared.selectedTarget.kind == .local {
+                    actions.append(openMenu)
+                }
                 actions.append(refreshAction)
                 actions.append(resignAction)
                 actions.append(reinstallMenu)
@@ -2475,7 +2647,7 @@ extension MyAppsViewController
                 actions.append(profileMenu)
             }
             
-            if installedApp.isActive
+            if isActiveOnTarget
             {
                 actions.append(jitAction)
             }
@@ -2487,7 +2659,7 @@ extension MyAppsViewController
                 actions.append(backupMenu)
             }
             
-            if installedApp.isActive
+            if isActiveOnTarget
             {
                 if installedApp.bundleIdentifier != StoreApp.altstoreAppID
                 {
@@ -2508,7 +2680,7 @@ extension MyAppsViewController
                 // Legacy sideloaded app, so can't detect if it's deleted.
                 actions.append(removeAction)
             }
-            else if !UserDefaults.standard.isLegacyDeactivationSupported && !installedApp.isActive
+            else if !UserDefaults.standard.isLegacyDeactivationSupported && !isActiveOnTarget
             {
                 // Inactive apps are actually deleted, so we need another way
                 // for user to remove them from AltStore.

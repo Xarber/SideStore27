@@ -68,10 +68,14 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                 authTeam: authTeam
             )
             self.context.installedApp = installedApp
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local {
+                await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            }
             return installedApp
         } catch {
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local {
+                await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            }
             throw error
         }
     }
@@ -109,7 +113,8 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                     certificate: certificate,
                     resignedAppBundle: resignedAppBundle,
                     storeBuildVersion: storeBuildVersion,
-                    authTeam: authTeam
+                    authTeam: authTeam,
+                    updateLocalRecord: isInstallingOnThisDevice
                 )
                 return (installedApp, false, self.context.targetBundleIdentifier, false, true)
             }
@@ -120,7 +125,8 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                 certificate: certificate,
                 resignedAppBundle: resignedAppBundle,
                 storeBuildVersion: storeBuildVersion,
-                authTeam: authTeam
+                authTeam: authTeam,
+                updateLocalRecord: isInstallingOnThisDevice
             )
             
             let isDifferentSideStore = Self.isDifferentSideStoreContainer(installedApp, resignedAppBundle)
@@ -135,18 +141,26 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                 """)
             } else {
                 /* App Extensions */
-                let installedExtensions = try self.fetchOrCreateExtensions(
-                    for: resignedAppBundle,
-                    installedApp: installedApp,
-                    in: backgroundContext
-                )
-                installedApp.appExtensions = installedExtensions
+                if isInstallingOnThisDevice || installedApp.isInserted {
+                    let installedExtensions = try self.fetchOrCreateExtensions(
+                        for: resignedAppBundle,
+                        installedApp: installedApp,
+                        in: backgroundContext
+                    )
+                    installedApp.appExtensions = installedExtensions
+                }
                 self.context.beginInstallationHandler?(installedApp)
-                self.updateActiveAppsStatus(
-                    for: installedApp,
-                    provisioningProfiles: provisioningProfiles,
-                    in: backgroundContext
-                )
+                if isInstallingOnThisDevice {
+                    self.updateActiveAppsStatus(
+                        for: installedApp,
+                        provisioningProfiles: provisioningProfiles,
+                        in: backgroundContext
+                    )
+                } else if installedApp.isInserted {
+                    // Managed remote records must not enter local background
+                    // refresh or masquerade as active on this device.
+                    installedApp.isActive = false
+                }
             }
             
             // This preserves our data in a serilized format that will be restored at boot onyl if installtion actually completed indicated by embedded provision uuid being different.
@@ -215,7 +229,8 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                                   certificate: ALTCertificate,
                                   resignedAppBundle: ALTApplication,
                                   storeBuildVersion: String?,
-                                  authTeam: ALTTeam) throws -> InstalledApp
+                                  authTeam: ALTTeam,
+                                  updateLocalRecord: Bool) throws -> InstalledApp
     {
         guard let appBundleFingerprint = self.context.appBundleFingerprint else {
             throw OperationError.invalidParameters("InstallAppOperation: context.appBundleFingerprint is nil. CacheAppOperation must guarantee a fingerprint reference.")
@@ -238,7 +253,8 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                                 storeBuildVersion: storeBuildVersion,
                                 context: backgroundContext
                             )
-        if !Self.isDifferentSideStoreContainer(installedApp, resignedAppBundle) {
+        if !Self.isDifferentSideStoreContainer(installedApp, resignedAppBundle)
+            && (updateLocalRecord || installedApp.isInserted) {
             installedApp.update(
                 resignedAppBundle: resignedAppBundle,
                 certificateSerialNumber: customCertSerial,

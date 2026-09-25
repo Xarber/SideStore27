@@ -457,8 +457,9 @@ func safeDebugApp(_ appId: String) async throws {
             try await safeDebugApp(appId)
         }
     }
-    guard DeviceOperationScope.target.kind != .stikServer else {
-        throw OperationError.invalidParameters("JIT is not yet available through StikServer; no command was sent to this device.")
+    if DeviceOperationScope.target.kind == .stikServer {
+        try await RemoteDeviceOperations.debugApp(appId)
+        return
     }
     try await ensureMinimuxerReady()
     try await debugApp(appId)

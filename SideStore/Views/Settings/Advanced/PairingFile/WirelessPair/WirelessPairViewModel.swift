@@ -329,12 +329,17 @@ final class WirelessPairViewModel: ObservableObject {
                 debugLog("[WirelessPairViewModel] confirmSelection -> Connecting to target '\(target.name)' at \(targetIp):\(targetPort)")
                 triggerPairing(targetIp: targetIp, targetPort: targetPort, targetName: target.name)
             case .nearby(let target):
-                guard let host = target.host, let port = target.port, port > 0 else {
-                    errorMessage = "The selected device has no reachable network address. Refresh and try again."
-                    statusText = "Device Unreachable"
-                    return
+                // _remotepairing._tcp is a paired device's service, not its
+                // manual-pairing listener. Connecting a pairing client to it
+                // closes the socket immediately with UnexpectedEof.
+                if target.pairingFileURL != nil {
+                    CommandTargetManager.shared.select(target)
+                    statusText = "Already Paired"
+                    subStatusText = "\(target.name) is already paired. It is now the selected device for SideStore commands."
+                } else {
+                    statusText = "Pairing Required"
+                    subStatusText = "To pair \(target.name), use Start Pairing Server here and connect from the other device, or open that device's manual pairing screen. Its normal Nearby Devices endpoint cannot accept a new pairing."
                 }
-                triggerPairing(targetIp: host, targetPort: port, targetName: target.name)
             case .configuredFallback:
                 let fallback = fallbackConfigEndpoint
                 debugLog("[WirelessPairViewModel] confirmSelection -> Connecting to configured fallback at \(fallback.ip):\(fallback.port)")
@@ -554,9 +559,12 @@ final class WirelessPairViewModel: ObservableObject {
                     CommandTargetManager.shared.startDiscovery()
                 case .failure(let error):
                     debugLog("[WirelessPairViewModel] triggerPairing() FAILURE: error='\(error.localizedDescription)'")
-                    self.errorMessage = error.localizedDescription
+                    let detail = error.localizedDescription
+                    self.errorMessage = detail.localizedCaseInsensitiveContains("UnexpectedEof")
+                        ? "This endpoint closed the pairing handshake. Choose a device advertising manual pairing, or use Start Pairing Server and connect from the other device."
+                        : detail
                     self.statusText = "Pairing Failed"
-                    self.subStatusText = "An error occurred during pairing: \(error.localizedDescription)"
+                    self.subStatusText = self.errorMessage ?? detail
                 }
                 completion?(result)
             }

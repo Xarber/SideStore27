@@ -652,7 +652,7 @@ final class AppManager: ObservableObject, @unchecked Sendable
         self.removeApp(installedApp, completionHandler: completionHandler)
     }
     
-    func enableJIT(for installedApp: InstalledApp, completionHandler: @escaping (Result<Void, Error>) -> Void)
+    func enableJIT(for installedApp: InstalledApp, target: CommandTarget, completionHandler: @escaping (Result<Void, Error>) -> Void)
     {
         Task.detached {
             debugLog("[AppManager] enableJIT() called for app: \(installedApp.bundleIdentifier)")
@@ -661,7 +661,7 @@ final class AppManager: ObservableObject, @unchecked Sendable
             do {
                 let enableJITOperation = try EnableJITOperation(installedApp: installedApp, context: context)
                 do {
-                    _ = try await DeviceOperationSession.run(target: .local) {
+                    _ = try await DeviceOperationSession.run(target: target) {
                         try await enableJITOperation.execute()
                     }
                     completionHandler(.success(()))
@@ -895,4 +895,3 @@ extension AppManager: PipelineProgress, PipelineExecutionContext, PipelineErrorL
     }
 
 }
-

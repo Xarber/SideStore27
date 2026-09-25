@@ -50,8 +50,9 @@ final class EnableJITOperation: BaseStandaloneOperation<StandaloneOperationConte
         let (targetBundleId, appName) = await dbContext.perform {
             (installedApp.resignedBundleIdentifier, installedApp.name)
         }
+        let commandTarget = await DeviceOperationScope.resolvedTarget()
 
-        if #available(iOS 17, *), userdefaults.isSideJITServerEnabled {
+        if #available(iOS 17, *), commandTarget.kind == .local, userdefaults.isSideJITServerEnabled {
             let sideJITURLString = await SideJITManager.shared.resolveServerURL()
             guard let serverURL = URL(string: sideJITURLString) else {
                 throw OperationError.unableToConnectSideJIT
@@ -92,13 +93,19 @@ final class EnableJITOperation: BaseStandaloneOperation<StandaloneOperationConte
                 let percent = 30 + Int64(Double(retry) / Double(maxRetries) * 60.0)
                 self.setProgress(percent)
                 do {
-                    await CellularRefreshManager.shared.turnOffDataIfNeeded()
+                    if commandTarget.kind == .local {
+                        await CellularRefreshManager.shared.turnOffDataIfNeeded()
+                    }
                     try await safeDebugApp(targetBundleId)
-                    await CellularRefreshManager.shared.turnOnDataIfNeeded()
+                    if commandTarget.kind == .local {
+                        await CellularRefreshManager.shared.turnOnDataIfNeeded()
+                    }
                     await notifyJITSuccess(appName: appName)
                     return
                 } catch {
-                    await CellularRefreshManager.shared.turnOnDataIfNeeded()
+                    if commandTarget.kind == .local {
+                        await CellularRefreshManager.shared.turnOnDataIfNeeded()
+                    }
                     lastError = error
                 }
             }

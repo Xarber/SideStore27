@@ -250,6 +250,8 @@ struct WirelessPairTargetDialog: View {
                     .frame(width: 24)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(target.name).font(.subheadline.weight(.semibold))
+                    Text(target.pairingFileURL == nil ? "Nearby device · pairing required" : "Already paired · use for commands")
+                        .font(.caption).foregroundColor(.secondary)
                     Text(target.deviceKind ?? "iOS device")
                         .font(.caption).foregroundColor(.secondary)
                     if let identifier = target.advertisedServiceIdentifier {
@@ -387,6 +389,9 @@ struct WirelessPairTargetDialog: View {
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                Text("Use only when this address is showing a manual-pairing listener; a normal nearby-device port will close the connection.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)

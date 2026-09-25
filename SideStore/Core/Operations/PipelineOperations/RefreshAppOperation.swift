@@ -46,37 +46,44 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
         }
         
         do {
-            await CellularRefreshManager.shared.turnOffDataIfNeeded()
             let target = DeviceOperationScope.target
+            if target.kind == .local { await CellularRefreshManager.shared.turnOffDataIfNeeded() }
             try await DeviceOperationSession.run(target: target) {
                 for profile in profiles.values {
                     try await installProvisioningProfiles(profile.data)
                 }
             }
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if target.kind == .local { await CellularRefreshManager.shared.turnOnDataIfNeeded() }
         } catch {
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local {
+                await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            }
             throw error
         }
         
         self.setProgress(80)
         let dbContext = self.context.dbBackgroundContext
+        let isLocalTarget = DeviceOperationScope.target.kind == .local
         
         let installedApp = try await dbContext.perform {
-            try self.updateInstalledApp(for: appBundle, profiles: profiles, in: dbContext)
+            try self.updateInstalledApp(for: appBundle, profiles: profiles,
+                                        updateLocalRecord: isLocalTarget, in: dbContext)
         }
         
         self.setProgress(100)
         return installedApp
     }
     
-    private func updateInstalledApp(for appBundle: ALTApplication, profiles: [String: ALTProvisioningProfile], in dbContext: NSManagedObjectContext) throws -> InstalledApp {
+    private func updateInstalledApp(for appBundle: ALTApplication, profiles: [String: ALTProvisioningProfile], updateLocalRecord: Bool, in dbContext: NSManagedObjectContext) throws -> InstalledApp {
         self.setProgress(self.progress.completedUnitCount + 1)
         
         guard let mainApp = self.context.installedApp,
               let installedApp = dbContext.object(with: mainApp.objectID) as? InstalledApp else {
             throw OperationError.invalidParameters("Could not find installed database record for '\(appBundle.name)'")
         }
+        // The record belongs to this SideStore installation. Remote expiry and
+        // active state are read from the selected device's profiles instead.
+        guard updateLocalRecord else { return installedApp }
         installedApp.update(provisioningProfile: profiles.values.first!)
         
         if let certStatus = self.context.targetCertStatus {

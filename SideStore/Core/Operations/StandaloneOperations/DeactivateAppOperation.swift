@@ -63,8 +63,8 @@ final class DeactivateAppOperation: BasePipelineOperation<PipelineOperationConte
         let range = endProgress - startProgress
         
         do {
-            await CellularRefreshManager.shared.turnOffDataIfNeeded()
             let target = DeviceOperationScope.target
+            if target.kind == .local { await CellularRefreshManager.shared.turnOffDataIfNeeded() }
             try await DeviceOperationSession.run(target: target) {
                 for (index, identifier) in allIdentifiers.enumerated() {
                     try await removeProvisioningProfile(identifier)
@@ -74,9 +74,11 @@ final class DeactivateAppOperation: BasePipelineOperation<PipelineOperationConte
                     }
                 }
             }
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if target.kind == .local { await CellularRefreshManager.shared.turnOnDataIfNeeded() }
         } catch {
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local {
+                await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            }
             throw error
         }
         // The Core Data record describes this iPad/iPhone. Removing a profile

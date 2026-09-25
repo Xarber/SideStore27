@@ -183,7 +183,6 @@ final class CommandTargetManager: ObservableObject {
     @Published private(set) var relayTargets: [CommandTarget] = []
     @Published private(set) var isDiscovering = false
 
-    private let selectedTargetKey = "SelectedCommandTarget"
     private var cancellables = Set<AnyCancellable>()
     private var resolutionTasks: [String: Task<Void, Never>] = [:]
     private lazy var nearbyBrowser: NearbyTargetBrowser = {
@@ -198,7 +197,7 @@ final class CommandTargetManager: ObservableObject {
         // A relaunch always returns to the safe, ordinary SideStore workflow.
         // Remote choices remain explicit for each app session.
         selectedTarget = .local
-        UserDefaults.standard.removeObject(forKey: selectedTargetKey)
+        UserDefaults.standard.removeObject(forKey: "SelectedCommandTarget")
 
         StikServerDeviceConnection.shared.$devices
             .receive(on: RunLoop.main)
@@ -213,9 +212,6 @@ final class CommandTargetManager: ObservableObject {
     func select(_ target: CommandTarget) {
         guard target != selectedTarget else { return }
         selectedTarget = target
-        if let data = try? JSONEncoder().encode(target) {
-            UserDefaults.standard.set(data, forKey: selectedTargetKey)
-        }
         NotificationCenter.default.post(name: .commandTargetDidChange, object: target)
     }
 
@@ -1201,7 +1197,14 @@ enum RemoteDeviceOperations {
 
     static func listApps() async throws -> [InstalledApplication] {
         let target = DeviceOperationScope.target
-        guard target.kind == .stikServer else { throw RemoteDeviceError.unsupportedRelay }
+        guard target.kind == .stikServer else {
+            try await ensureReady()
+            let found = try await minimuxer.gateway.listInstalledApps()
+            return found.map {
+                InstalledApplication(bundleId: $0.bundleId, name: $0.name,
+                                     version: $0.version, buildVersion: $0.buildVersion)
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
         let response = try await StikServerDeviceConnection.shared.request(
             "sideStoreListApps", target: target, fields: [:], timeout: 60
         )
@@ -1264,6 +1267,12 @@ enum RemoteDeviceOperations {
     static func removeApp(_ bundleID: String) async throws {
         try await command("sideStoreRemoveApp", fields: ["bundleId": bundleID]) {
             try await minimuxer.core.removeApp(bundleId: bundleID)
+        }
+    }
+
+    static func debugApp(_ bundleID: String) async throws {
+        try await command("sideStoreDebugApp", fields: ["bundleId": bundleID], timeout: 60) {
+            try await minimuxer.core.debugApp(appId: bundleID)
         }
     }
 
