@@ -567,10 +567,10 @@ private extension MyAppsViewController {
         let context = DatabaseManager.shared.viewContext
         let knownIDs = Set(InstalledApp.all(in: context).map(\.resignedBundleIdentifier))
         var addedIDs = Set<String>()
-        for app in apps where profiles[app.bundleId] != nil &&
+        for app in apps where (profiles[app.bundleId] != nil || Self.isDeveloperSigned(app.signerIdentity)) &&
             !knownIDs.contains(app.bundleId) && addedIDs.insert(app.bundleId).inserted {
-            // Provisioned apps are sideloaded; ordinary App Store apps are not
-            // imported into SideStore's managed-app database.
+            // A profile or developer signing identifies sideloaded apps. Do not
+            // import every User app; that would include App Store purchases.
             let discovered = NSEntityDescription.insertNewObject(
                 forEntityName: "InstalledApp", into: context
             ) as! InstalledApp
@@ -588,6 +588,15 @@ private extension MyAppsViewController {
             discovered.certificateStatusRaw = "remoteDiscovered"
         }
         if context.hasChanges { try context.save() }
+    }
+
+    private static func isDeveloperSigned(_ identity: String?) -> Bool {
+        guard let identity else { return false }
+        let normalized = identity.lowercased()
+        return normalized.hasPrefix("apple development:") ||
+            normalized.hasPrefix("iphone developer:") ||
+            normalized.hasPrefix("apple distribution:") ||
+            normalized.hasPrefix("iphone distribution:")
     }
 
     private func offerPackageForDiscoveredApp(_ app: InstalledApp) {
@@ -1239,9 +1248,13 @@ private extension MyAppsViewController
     {
         Task { @MainActor in
             let installedApps: [InstalledApp]
+            var appsNeedingPackage = 0
             if let remoteIDs = self.visibleRemoteAppIDs {
                 let activeIDs = Set(self.remoteProfileExpirations?.keys.map { $0 } ?? [])
-                installedApps = InstalledApp.all(in: DatabaseManager.shared.viewContext)
+                let remoteApps = InstalledApp.all(in: DatabaseManager.shared.viewContext)
+                    .filter { remoteIDs.contains($0.resignedBundleIdentifier) && activeIDs.contains($0.resignedBundleIdentifier) }
+                appsNeedingPackage = remoteApps.filter(\.isDiscoveredRemoteApp).count
+                installedApps = remoteApps
                     .filter { !$0.isDiscoveredRemoteApp && remoteIDs.contains($0.resignedBundleIdentifier)
                         && activeIDs.contains($0.resignedBundleIdentifier) }
                     .sorted { $0.bundleIdentifier == StoreApp.altstoreAppID ? false :
@@ -1253,6 +1266,16 @@ private extension MyAppsViewController
                     .filter { self.visibleLocalAppIDs?.contains($0.resignedBundleIdentifier) ?? true }
             }
             guard !installedApps.isEmpty else {
+                if appsNeedingPackage > 0 {
+                    let alert = UIAlertController(
+                        title: "IPA Needed to Refresh",
+                        message: "These apps were installed by another SideStore. Open an app in My Apps to install it from a known source or import its IPA before refreshing.",
+                        preferredStyle: .alert
+                    )
+                    alert.addAction(.ok)
+                    self.present(alert, animated: true)
+                    return
+                }
                 let error: Error
                 
                 if let altstoreApp = InstalledApp.fetchAltStore(in: DatabaseManager.shared.viewContext),
@@ -1270,6 +1293,9 @@ private extension MyAppsViewController
                 let toastView = ToastView(error: error)
                 toastView.show(in: self)
                 return
+            }
+            if appsNeedingPackage > 0 {
+                ToastView(text: "Some apps need an IPA", detailText: "Refresh All will skip apps discovered from another SideStore. Open each app to choose its source or import an IPA.").show(in: self)
             }
             
             self.isRefreshingAllApps = true

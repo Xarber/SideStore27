@@ -1163,6 +1163,7 @@ enum RemoteDeviceOperations {
         let name: String
         let version: String
         let buildVersion: String
+        let signerIdentity: String?
     }
 
     struct HealthStatus: Sendable {
@@ -1202,7 +1203,8 @@ enum RemoteDeviceOperations {
             let found = try await minimuxer.gateway.listInstalledApps()
             return found.map {
                 InstalledApplication(bundleId: $0.bundleId, name: $0.name,
-                                     version: $0.version, buildVersion: $0.buildVersion)
+                                     version: $0.version, buildVersion: $0.buildVersion,
+                                     signerIdentity: $0.signerIdentity)
             }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         }
         let response = try await StikServerDeviceConnection.shared.request(
