@@ -211,7 +211,7 @@ final class HealthCheckViewModel: ObservableObject {
             pairingVerified: false,
             isRpPairing: target.kind != .local,
             isPairingLoaded: target.pairingFileURL != nil || target.kind == .stikServer,
-            readyResult: .failure(.noConnection),
+            readyResult: .failure(.noConnection("The selected device could not be reached.")),
             scanned: network.activeInterfaces
         )
     }
