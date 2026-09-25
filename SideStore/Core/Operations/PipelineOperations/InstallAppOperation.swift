@@ -96,6 +96,7 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
                             storeBuildVersion: String?,
                             authTeam: ALTTeam) async throws -> InstalledApp
     {
+        let isInstallingOnThisDevice = DeviceOperationScope.target.kind == .local
         let (installedApp, isDifferentSideStore, bundleID, isSelfReinstall, isSideBackup) = try await backgroundContext.perform {
             let utis = resignedAppBundle.infoPlist[Bundle.Info.exportedUTIs] as? [[String: Any]]
             let isSideBackup = utis?.first?["UTTypeDescription"] as? String == "SideStore Backup App"
@@ -150,6 +151,7 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
             
             // This preserves our data in a serilized format that will be restored at boot onyl if installtion actually completed indicated by embedded provision uuid being different.
             let isSelfReinstall = !isDifferentSideStore &&
+                                   isInstallingOnThisDevice &&
                                    installedApp.storeApp?.bundleIdentifier.range(of: Bundle.Info.appbundleIdentifier) != nil
             if isSelfReinstall {
                 if let _ = provisioningProfiles[self.context.targetBundleIdentifier],

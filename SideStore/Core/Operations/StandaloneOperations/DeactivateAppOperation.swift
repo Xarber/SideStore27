@@ -79,7 +79,11 @@ final class DeactivateAppOperation: BasePipelineOperation<PipelineOperationConte
             await CellularRefreshManager.shared.turnOnDataIfNeeded()
             throw error
         }
-        installedApp.isActive = false
+        // The Core Data record describes this iPad/iPhone. Removing a profile
+        // from another device must not deactivate the local copy of the app.
+        if DeviceOperationScope.target.kind == .local {
+            installedApp.isActive = false
+        }
         return installedApp
     }
 }

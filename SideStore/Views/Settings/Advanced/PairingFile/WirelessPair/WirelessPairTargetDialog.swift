@@ -211,7 +211,7 @@ struct WirelessPairTargetDialog: View {
                 .foregroundColor(.secondary)
                 .padding(.horizontal, 4)
             
-            if viewModel.discoveredTargets.isEmpty {
+            if viewModel.discoveredTargets.isEmpty && viewModel.nearbyTargets.isEmpty {
                 HStack(spacing: 10) {
                     if viewModel.isScanning {
                         ProgressView()
@@ -229,12 +229,42 @@ struct WirelessPairTargetDialog: View {
                 .padding(.horizontal, 4)
             } else {
                 VStack(spacing: 12) {
+                    ForEach(viewModel.nearbyTargets) { target in
+                        nearbyTargetRow(for: target)
+                    }
                     ForEach(viewModel.discoveredTargets) { target in
                         discoveredTargetRow(for: target)
                     }
                 }
             }
         }
+    }
+
+    private func nearbyTargetRow(for target: CommandTarget) -> some View {
+        let isSelected = viewModel.isNearbyTargetSelected(target)
+        return SwiftUI.Button {
+            viewModel.selectNearbyTarget(target)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: (target.deviceKind ?? target.name).lowercased().contains("ipad") ? "ipad" : "iphone")
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(target.name).font(.subheadline.weight(.semibold))
+                    Text(target.deviceKind ?? "iOS device")
+                        .font(.caption).foregroundColor(.secondary)
+                    if let identifier = target.advertisedServiceIdentifier {
+                        Text(identifier).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer()
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isSelected ? .accentColor : .secondary)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 16).fill(Color.accentColor.opacity(isSelected ? 0.16 : 0.06)))
+        }
+        .buttonStyle(.plain)
     }
     
     private func discoveredTargetRow(for target: WirelessPairTarget) -> some View {

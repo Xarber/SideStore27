@@ -14,6 +14,7 @@ import Minimuxer
 
 enum SelectedEndpointOption: Equatable {
     case discovered(WirelessPairTarget)
+    case nearby(CommandTarget)
     case configuredFallback
 }
 
@@ -89,6 +90,7 @@ final class WirelessPairViewModel: ObservableObject {
     
     // Discovery State
     @Published var discoveredTargets: [WirelessPairTarget] = []
+    @Published var nearbyTargets: [CommandTarget] = []
     @Published var isScanning = false
     @Published var activeInterfaces: [LocalInterfaceInfo] = []
     
@@ -133,6 +135,10 @@ final class WirelessPairViewModel: ObservableObject {
     init() {
         debugLog("[WirelessPairViewModel] init() initializing...")
         activeInterfaces = minimuxer.network.activeInterfaces
+        CommandTargetManager.shared.$nearbyTargets
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.nearbyTargets = $0 }
+            .store(in: &cancellables)
         
         // Setup closures once
         wirelessPairing.onReadyToPair = { [weak self] (serviceID: String, port: Int) in
@@ -215,6 +221,15 @@ final class WirelessPairViewModel: ObservableObject {
     func selectTarget(_ target: WirelessPairTarget) {
         debugLog("[WirelessPairViewModel] selectTarget() selected: '\(target.name)' (\(target.rawType)) -> v4=\(target.ipv4 ?? "none"), v6=\(target.ipv6 ?? "none"), port=\(target.port)")
         selectedOption = .discovered(target)
+    }
+
+    func selectNearbyTarget(_ target: CommandTarget) {
+        selectedOption = .nearby(target)
+    }
+
+    func isNearbyTargetSelected(_ target: CommandTarget) -> Bool {
+        if case .nearby(let selected) = selectedOption { return selected.id == target.id }
+        return false
     }
     
     func selectFallbackEndpoint() {
@@ -313,6 +328,13 @@ final class WirelessPairViewModel: ObservableObject {
                 let targetPort = target.port
                 debugLog("[WirelessPairViewModel] confirmSelection -> Connecting to target '\(target.name)' at \(targetIp):\(targetPort)")
                 triggerPairing(targetIp: targetIp, targetPort: targetPort, targetName: target.name)
+            case .nearby(let target):
+                guard let host = target.host, let port = target.port, port > 0 else {
+                    errorMessage = "The selected device has no reachable network address. Refresh and try again."
+                    statusText = "Device Unreachable"
+                    return
+                }
+                triggerPairing(targetIp: host, targetPort: port, targetName: target.name)
             case .configuredFallback:
                 let fallback = fallbackConfigEndpoint
                 debugLog("[WirelessPairViewModel] confirmSelection -> Connecting to configured fallback at \(fallback.ip):\(fallback.port)")
@@ -340,6 +362,7 @@ final class WirelessPairViewModel: ObservableObject {
         discoveryTask?.cancel()
         isScanning = true
         discoveredTargets.removeAll()
+        CommandTargetManager.shared.startDiscovery()
         
         discoveryTask = Task { @MainActor [weak self] in
             guard let self = self else { return }

@@ -263,7 +263,7 @@ class MyAppsViewController: UICollectionViewController
             
             self.statusDotView?.removeFromSuperview()
             
-            let titleText = NSLocalizedString("My Apps", comment: "")
+            let titleText = self.navigationItem.title ?? NSLocalizedString("My Apps", comment: "")
             let font = UIFont.systemFont(ofSize: 34, weight: .bold)
             let textWidth = titleText.size(withAttributes: [.font: font]).width
             let leftMargin: CGFloat = 20
@@ -461,8 +461,17 @@ private extension MyAppsViewController {
         remoteAppsViewController = nil
         collectionView.isHidden = false
 
+        navigationItem.title = target.kind == .stikServer ? "\(target.name)'s Apps" : NSLocalizedString("My Apps", comment: "")
         guard target.kind == .stikServer else { return }
-        let controller = UIHostingController(rootView: RemoteInstalledAppsView(target: target))
+        let controller = UIHostingController(rootView: RemoteInstalledAppsView(target: target) { [weak self] bundleID, completion in
+            guard let self,
+                  let app = InstalledApp.all(in: DatabaseManager.shared.viewContext)
+                    .first(where: { $0.resignedBundleIdentifier == bundleID }) else {
+                completion()
+                return
+            }
+            self.refresh([app]) { _ in completion() }
+        })
         addChild(controller)
         controller.view.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(controller.view)
