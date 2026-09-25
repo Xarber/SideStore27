@@ -81,6 +81,17 @@ final class DeviceRegistrationFlow: @unchecked Sendable {
     ) async throws -> ALTDevice {
         debugLog("[DeviceRegistrationFlow] performDeviceRegistration starting...")
         let udid = try await self.fetchDeviceUDID()
+        let validUDID = udid.range(
+            of: "^(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$",
+            options: .regularExpression
+        ) != nil
+        guard validUDID else {
+            throw NSError(
+                domain: "SideStore.DeviceRegistration",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The selected connection returned a temporary session identifier instead of the device UDID. Reconnect the device and try again."]
+            )
+        }
         debugLog("[DeviceRegistrationFlow] Fetched device UDID: \(udid). Fetching team devices...")
         
         let devices = try await DeveloperPortalProxy.shared.fetchDevices(for: team, types: .all)

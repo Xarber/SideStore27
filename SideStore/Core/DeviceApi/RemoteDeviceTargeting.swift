@@ -20,6 +20,7 @@ private struct ResolvedNearbyService: Equatable {
     let name: String
     let type: String
     let host: String
+    let hostname: String
     let port: UInt16
     let txt: [String: String]
 }
@@ -99,6 +100,7 @@ private final class NearbyTargetBrowser: NSObject, NetServiceBrowserDelegate, Ne
             name: sender.name,
             type: sender.type,
             host: host,
+            hostname: hostname,
             port: UInt16(clamping: sender.port),
             txt: txt
         )
@@ -125,7 +127,7 @@ enum CommandTargetKind: String, Codable, Sendable {
 
 struct CommandTarget: Codable, Equatable, Identifiable, Sendable {
     let id: String
-    let name: String
+    var name: String
     let kind: CommandTargetKind
     var deviceKind: String? = nil
     var pairingIdentifier: String? = nil
@@ -236,20 +238,32 @@ final class CommandTargetManager: ObservableObject {
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
             let serviceIdentifier = identifiers.first ?? service.name
-            let advertisedName = service.txt["name"] ?? service.txt["devicename"] ?? service.name
+            let advertisedName = Self.displayName(
+                txt: service.txt,
+                hostname: service.hostname,
+                serviceName: service.name
+            )
             let normalizedName = Self.normalizedDeviceName(advertisedName)
             let pairing = pairings.first(where: {
                 $0.serviceIdentifier?.caseInsensitiveCompare(service.id) == .orderedSame
                     || $0.serviceIdentifier?.caseInsensitiveCompare(serviceIdentifier) == .orderedSame
+                    || $0.endpointHost?.caseInsensitiveCompare(service.host) == .orderedSame
             }) ?? pairings.first(where: {
                 Self.normalizedDeviceName($0.displayName) == normalizedName
             })
+            let displayName = pairing?.displayName ?? advertisedName
+            let model = service.txt["model"] ?? service.txt["modelidentifier"]
+                ?? service.txt["deviceclass"] ?? pairing?.modelIdentifier
+                ?? Self.inferredDeviceKind(from: displayName)
+            let stableIdentity = pairing?.deviceIdentifier
+                ?? pairing?.url.lastPathComponent
+                ?? Self.normalizedDeviceName(displayName)
             return CommandTarget(
-                id: "nearby|\(serviceIdentifier.lowercased())",
-                name: service.txt["name"] ?? service.txt["devicename"] ?? pairing?.displayName ?? service.name,
+                id: "nearby|\(stableIdentity.lowercased())",
+                name: displayName,
                 kind: .nearby,
-                deviceKind: service.txt["model"] ?? service.txt["modelidentifier"] ?? service.txt["deviceclass"] ?? pairing?.modelIdentifier,
-                pairingIdentifier: pairing?.deviceIdentifier ?? identifiers.first,
+                deviceKind: model,
+                pairingIdentifier: pairing?.deviceIdentifier,
                 advertisedServiceIdentifier: serviceIdentifier,
                 discoveryServiceID: service.id,
                 discoveryServiceType: service.type,
@@ -261,7 +275,7 @@ final class CommandTargetManager: ObservableObject {
         let oldTargets = nearbyTargets
         nearbyTargets = targets
         isDiscovering = nearbyBrowser.isSearching
-        if let refreshed = targets.first(where: { $0.id == selectedTarget.id }), refreshed != selectedTarget {
+        if let refreshed = targets.first(where: { Self.sameDevice($0, selectedTarget) }), refreshed != selectedTarget {
             select(refreshed)
         }
         if oldTargets != targets {
@@ -420,6 +434,39 @@ final class CommandTargetManager: ObservableObject {
             .map(String.init)
             .joined()
     }
+
+    private static func displayName(txt: [String: String], hostname: String, serviceName: String) -> String {
+        if let value = [txt["name"], txt["devicename"]]
+            .compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty && normalizedDeviceName($0) != "uuid" }) {
+            return value
+        }
+        let host = hostname
+            .replacingOccurrences(of: ".local.", with: "", options: [.caseInsensitive])
+            .replacingOccurrences(of: ".local", with: "", options: [.caseInsensitive])
+            .replacingOccurrences(of: "-", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !host.isEmpty, normalizedDeviceName(host) != "uuid" { return host }
+        return serviceName
+    }
+
+    private static func inferredDeviceKind(from value: String) -> String? {
+        let value = value.lowercased()
+        if value.contains("ipad") { return "iPad" }
+        if value.contains("iphone") { return "iPhone" }
+        return nil
+    }
+
+    private static func sameDevice(_ lhs: CommandTarget, _ rhs: CommandTarget) -> Bool {
+        guard lhs.kind == rhs.kind else { return false }
+        if lhs.id == rhs.id { return true }
+        if let left = lhs.pairingFilePath, left == rhs.pairingFilePath { return true }
+        if let left = lhs.pairingIdentifier, let right = rhs.pairingIdentifier,
+           left.caseInsensitiveCompare(right) == .orderedSame { return true }
+        if let left = lhs.host, let right = rhs.host,
+           left.caseInsensitiveCompare(right) == .orderedSame { return true }
+        return normalizedDeviceName(lhs.name) == normalizedDeviceName(rhs.name)
+    }
 }
 
 struct RemotePairingFile: Identifiable, Equatable, Sendable {
@@ -431,6 +478,7 @@ struct RemotePairingFile: Identifiable, Equatable, Sendable {
     let deviceIdentifier: String?
     let modelIdentifier: String?
     let serviceIdentifier: String?
+    let endpointHost: String?
     let createdAt: Date
     let lastConnectedAt: Date?
 }
@@ -441,6 +489,7 @@ private struct RemotePairingMetadata: Codable, Sendable {
     var deviceIdentifier: String?
     var modelIdentifier: String?
     var serviceIdentifier: String?
+    var endpointHost: String?
     var createdAt: Date
     var lastConnectedAt: Date?
 }
@@ -483,6 +532,7 @@ extension PairingFileManager {
             deviceIdentifier: deviceIdentifier,
             modelIdentifier: modelIdentifier,
             serviceIdentifier: nil,
+            endpointHost: nil,
             createdAt: Date(),
             lastConnectedAt: nil
         )
@@ -497,6 +547,7 @@ extension PairingFileManager {
             deviceIdentifier: deviceIdentifier,
             modelIdentifier: modelIdentifier,
             serviceIdentifier: nil,
+            endpointHost: nil,
             createdAt: record.createdAt,
             lastConnectedAt: nil
         )
@@ -537,6 +588,7 @@ extension PairingFileManager {
             deviceIdentifier: deviceIdentifier,
             modelIdentifier: modelIdentifier,
             serviceIdentifier: existing?.serviceIdentifier,
+            endpointHost: existing?.endpointHost,
             createdAt: createdAt,
             lastConnectedAt: existing?.lastConnectedAt
         )
@@ -551,6 +603,7 @@ extension PairingFileManager {
             deviceIdentifier: deviceIdentifier,
             modelIdentifier: modelIdentifier,
             serviceIdentifier: record.serviceIdentifier,
+            endpointHost: record.endpointHost,
             createdAt: createdAt,
             lastConnectedAt: record.lastConnectedAt
         )
@@ -593,6 +646,7 @@ extension PairingFileManager {
                 deviceIdentifier: record?.deviceIdentifier ?? (parsed as? LockdownPairingFile)?.udid,
                 modelIdentifier: record?.modelIdentifier,
                 serviceIdentifier: record?.serviceIdentifier,
+                endpointHost: record?.endpointHost,
                 createdAt: record?.createdAt ?? ((try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast),
                 lastConnectedAt: record?.lastConnectedAt
             )
@@ -605,8 +659,12 @@ extension PairingFileManager {
         let mode: PairingProtocol = target.discoveryServiceType?.contains("apple-mobdev2") == true ? .lockdown : .rppairing
         let files = remotePairingFiles().filter { $0.mode == mode }
         return files.sorted { lhs, rhs in
-            let lhsExact = lhs.url.path == target.pairingFilePath || lhs.serviceIdentifier == target.discoveryServiceID
-            let rhsExact = rhs.url.path == target.pairingFilePath || rhs.serviceIdentifier == target.discoveryServiceID
+            let lhsExact = lhs.url.path == target.pairingFilePath
+                || lhs.serviceIdentifier == target.discoveryServiceID
+                || lhs.endpointHost == target.host
+            let rhsExact = rhs.url.path == target.pairingFilePath
+                || rhs.serviceIdentifier == target.discoveryServiceID
+                || rhs.endpointHost == target.host
             if lhsExact != rhsExact { return lhsExact }
             return (lhs.lastConnectedAt ?? lhs.createdAt) > (rhs.lastConnectedAt ?? rhs.createdAt)
         }
@@ -619,19 +677,25 @@ extension PairingFileManager {
     ) {
         var metadata = remotePairingMetadata()
         let now = Date()
+        let targetNameIsIdentifier = target.name.caseInsensitiveCompare(target.advertisedServiceIdentifier ?? "") == .orderedSame
+            || UUID(uuidString: target.name) != nil
+            || target.name.caseInsensitiveCompare("uuid") == .orderedSame
+        let resolvedDisplayName = targetNameIsIdentifier ? file.displayName : target.name
         if let index = metadata.firstIndex(where: { $0.fileName == file.url.lastPathComponent }) {
-            metadata[index].displayName = target.name
+            metadata[index].displayName = resolvedDisplayName
             metadata[index].deviceIdentifier = deviceIdentifier ?? metadata[index].deviceIdentifier
             metadata[index].modelIdentifier = target.deviceKind ?? metadata[index].modelIdentifier
             metadata[index].serviceIdentifier = target.advertisedServiceIdentifier ?? target.discoveryServiceID
+            metadata[index].endpointHost = target.host ?? metadata[index].endpointHost
             metadata[index].lastConnectedAt = now
         } else {
             metadata.append(RemotePairingMetadata(
                 fileName: file.url.lastPathComponent,
-                displayName: target.name,
+                displayName: resolvedDisplayName,
                 deviceIdentifier: deviceIdentifier,
                 modelIdentifier: target.deviceKind,
                 serviceIdentifier: target.advertisedServiceIdentifier ?? target.discoveryServiceID,
+                endpointHost: target.host,
                 createdAt: file.createdAt,
                 lastConnectedAt: now
             ))
@@ -800,9 +864,19 @@ private actor DeviceSessionCoordinator {
                     throw lastError ?? RemoteDeviceError.missingPairingFile
                 }
                 let deviceIdentifier = try? await minimuxer.core.fetchUDID()
+                var identifiedTarget = target
+                if let deviceName = try? await minimuxer.gateway.getLockdownValue(key: "DeviceName"),
+                   !deviceName.isEmpty,
+                   deviceName.caseInsensitiveCompare("uuid") != .orderedSame {
+                    identifiedTarget.name = deviceName
+                }
+                if let productType = try? await minimuxer.gateway.getLockdownValue(key: "ProductType"),
+                   !productType.isEmpty {
+                    identifiedTarget.deviceKind = productType
+                }
                 PairingFileManager.shared.bindRemotePairingFile(
                     connectedFile,
-                    to: target,
+                    to: identifiedTarget,
                     deviceIdentifier: deviceIdentifier
                 )
                 let result = try await operation()

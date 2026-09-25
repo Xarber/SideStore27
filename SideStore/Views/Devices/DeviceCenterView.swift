@@ -153,7 +153,7 @@ struct DeviceCenterView: View {
     private var pairingSection: some View {
         Section {
             NavigationLink {
-                WirelessPairView(automaticallyPresentClient: true)
+                WirelessPairView()
             } label: {
                 Label("Pair a New Device", systemImage: "link.badge.plus")
             }
