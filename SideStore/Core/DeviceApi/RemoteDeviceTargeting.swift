@@ -948,6 +948,15 @@ enum StikServerRequestError: LocalizedError {
 }
 
 enum RemoteDeviceOperations {
+    struct HealthStatus: Sendable {
+        let reachable: Bool
+        let pairingLoaded: Bool
+        let pairingVerified: Bool
+        let ddiMounted: Bool
+        let protocolName: String
+        let udid: String?
+    }
+
     static func ensureReady() async throws {
         let target = DeviceOperationScope.target
         if target.kind == .stikServer {
@@ -967,6 +976,42 @@ enum RemoteDeviceOperations {
             throw RemoteDeviceError.invalidRelayResponse("missing device identifier")
         }
         return udid
+    }
+
+    static func healthCheck() async throws -> HealthStatus {
+        let target = DeviceOperationScope.target
+        guard target.kind == .stikServer else {
+            let ready = await minimuxer.core.isReady(withDDIMountCheck: true)
+            if case .failure(let error) = ready { throw error.asOperationError }
+            let ddiMounted = (try? await minimuxer.core.isDDIMounted()) ?? false
+            let udid = try? await minimuxer.core.fetchUDID()
+            let protocolName: String
+            switch minimuxer.core.pairingFileType {
+            case .rppairing: protocolName = "Remote Pairing"
+            case .lockdown: protocolName = "Lockdown"
+            case .unknown: protocolName = "Unknown"
+            }
+            return HealthStatus(
+                reachable: true,
+                pairingLoaded: minimuxer.core.isPairingFileLoaded,
+                pairingVerified: udid != nil,
+                ddiMounted: ddiMounted,
+                protocolName: protocolName,
+                udid: udid
+            )
+        }
+
+        let response = try await StikServerDeviceConnection.shared.request(
+            "sideStoreHealth", target: target, fields: [:], timeout: 30
+        )
+        return HealthStatus(
+            reachable: response["reachable"] as? Bool ?? true,
+            pairingLoaded: response["pairingLoaded"] as? Bool ?? true,
+            pairingVerified: response["pairingVerified"] as? Bool ?? true,
+            ddiMounted: response["ddiMounted"] as? Bool ?? false,
+            protocolName: response["protocol"] as? String ?? "Remote Pairing",
+            udid: response["udid"] as? String
+        )
     }
 
     static func installProfile(_ data: Data) async throws {
@@ -1046,14 +1091,37 @@ enum RemoteDeviceOperations {
             fields: ["mode": { if case .zip = mode { return "zip" }; return "raw" }()],
             timeout: 120
         )
-        guard let encoded = response["data"] as? String,
-              let data = Data(base64Encoded: encoded),
-              let filename = response["filename"] as? String else {
-            throw RemoteDeviceError.invalidRelayResponse("missing provisioning profile archive")
+        if let encoded = response["data"] as? String,
+           let data = Data(base64Encoded: encoded),
+           let filename = response["filename"] as? String {
+            let url = URL(fileURLWithPath: directory).appendingPathComponent(filename)
+            try data.write(to: url, options: .atomic)
+            return url.path
         }
-        let url = URL(fileURLWithPath: directory).appendingPathComponent(filename)
-        try data.write(to: url, options: .atomic)
-        return url.path
+
+        guard let encodedProfiles = response["profiles"] as? [String] else {
+            throw RemoteDeviceError.invalidRelayResponse("missing provisioning profiles")
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let exportURL = URL(fileURLWithPath: directory)
+            .appendingPathComponent("ProvisioningProfiles-\(formatter.string(from: Date()))", isDirectory: true)
+        try FileManager.default.createDirectory(at: exportURL, withIntermediateDirectories: true)
+        do {
+            for (index, encoded) in encodedProfiles.enumerated() {
+                guard let data = Data(base64Encoded: encoded) else {
+                    throw RemoteDeviceError.invalidRelayResponse("invalid provisioning profile data")
+                }
+                let fileURL = exportURL.appendingPathComponent(
+                    String(format: "profile-%03d.mobileprovision", index + 1)
+                )
+                try data.write(to: fileURL, options: .atomic)
+            }
+            return exportURL.path
+        } catch {
+            try? FileManager.default.removeItem(at: exportURL)
+            throw error
+        }
     }
 
     private static func commandWithData(_ name: String, data: Data) async throws {
@@ -1385,6 +1453,25 @@ final class SideStoreRelayAgent {
         case "sideStoreReady":
             if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) { throw error }
             return [:]
+        case "sideStoreHealth":
+            if case .failure(let error) = await minimuxer.core.isReady(withNetworkCheck: true) { throw error }
+            let ddiMounted = (try? await minimuxer.core.isDDIMounted()) ?? false
+            let udid = try? await minimuxer.core.fetchUDID()
+            let protocolName: String
+            switch minimuxer.core.pairingFileType {
+            case .rppairing: protocolName = "Remote Pairing"
+            case .lockdown: protocolName = "Lockdown"
+            case .unknown: protocolName = "Unknown"
+            }
+            var values: [String: Any] = [
+                "reachable": true,
+                "pairingLoaded": minimuxer.core.isPairingFileLoaded,
+                "pairingVerified": udid != nil,
+                "ddiMounted": ddiMounted,
+                "protocol": protocolName
+            ]
+            if let udid { values["udid"] = udid }
+            return values
         case "sideStoreUDID":
             return ["udid": try await minimuxer.core.fetchUDID()]
         case "sideStoreInstallProfile":

@@ -51,6 +51,8 @@ struct HealthCheckView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 8)
+            } header: {
+                Text("Command Target: \(viewModel.targetName)")
             }
             
             // Section 2: Core Dependencies

@@ -29,7 +29,7 @@ struct DeviceCenterView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
+                SwiftUI.Button {
                     targets.startDiscovery()
                 } label: {
                     Image(systemName: "arrow.clockwise")
@@ -50,7 +50,7 @@ struct DeviceCenterView: View {
             get: { alertMessage != nil },
             set: { if !$0 { alertMessage = nil } }
         )) {
-            Button("OK", role: .cancel) { alertMessage = nil }
+            SwiftUI.Button("OK", role: .cancel) { alertMessage = nil }
         } message: {
             Text(alertMessage ?? "")
         }
@@ -102,7 +102,7 @@ struct DeviceCenterView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
 
-            Button {
+            SwiftUI.Button {
                 switch stikServer.state {
                 case .connected, .connecting:
                     stikServer.disconnect()
@@ -158,7 +158,7 @@ struct DeviceCenterView: View {
 
     @ViewBuilder
     private func deviceRow(_ target: CommandTarget, selectable: Bool) -> some View {
-        Button {
+        SwiftUI.Button {
             if selectable {
                 targets.select(target)
             } else if target.kind == .nearby {

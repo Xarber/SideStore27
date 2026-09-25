@@ -26,6 +26,7 @@ import Combine
 
 @MainActor
 final class HealthCheckViewModel: ObservableObject {
+    @Published var targetName = CommandTarget.local.name
     @Published var isWifiSatisfied = false
     @Published var isWiredSatisfied = false
     @Published var isUsbSatisfied = false
@@ -61,7 +62,7 @@ final class HealthCheckViewModel: ObservableObject {
     @Published var minimuxerReadyResult: Result<Bool, MinimuxerError>? = nil
     @Published var availableInterfaces: [LocalInterfaceInfo] = []
 
-    struct HealthCheckMetrics {
+    struct HealthCheckMetrics: @unchecked Sendable {
         let connectionMode: DeviceConnectionMode
         let wifi: Bool
         let wired: Bool
@@ -87,7 +88,23 @@ final class HealthCheckViewModel: ObservableObject {
         let scanned: [LocalInterfaceInfo]
     }
 
-    nonisolated private func fetchMetrics() async -> HealthCheckMetrics {
+    private func fetchMetrics() async -> HealthCheckMetrics {
+        let target = CommandTargetManager.shared.selectedTarget
+        targetName = target.name
+        do {
+            return try await DeviceOperationSession.run(target: target) {
+                if target.kind == .stikServer {
+                    let status = try await RemoteDeviceOperations.healthCheck()
+                    return Self.relayMetrics(target: target, status: status)
+                }
+                return await Self.fetchDirectMetrics()
+            }
+        } catch {
+            return Self.failedMetrics(target: target)
+        }
+    }
+
+    nonisolated private static func fetchDirectMetrics() async -> HealthCheckMetrics {
         let mode = await minimuxer.core.getConnectionMode()
         let wifi = minimuxer.network.isWifiSatisfied
         let wired = minimuxer.network.isWiredSatisfied
@@ -120,9 +137,7 @@ final class HealthCheckViewModel: ObservableObject {
         let pingSuccess = !targetIp.isEmpty && minimuxer.core.testDeviceConnection(ifaddr: targetIp)
         
         let ddi = (try? await minimuxer.core.isDDIMounted()) ?? false
-        let pairingVerified = (try? await DeviceOperationSession.run(target: .local) {
-            try await fetchUDID(forceLive: true)
-        }) != nil
+        let pairingVerified = (try? await fetchUDID(forceLive: true)) != nil
         let isRpPairing = minimuxer.core.pairingFileType == .rppairing
         let isPairingLoaded = minimuxer.core.isPairingFileLoaded
         let readyResult = await minimuxer.core.isReady(withDDIMountCheck: true)
@@ -137,6 +152,67 @@ final class HealthCheckViewModel: ObservableObject {
             protocolStr: protocolStr, pingSuccess: pingSuccess,
             ddi: ddi, pairingVerified: pairingVerified, isRpPairing: isRpPairing, isPairingLoaded: isPairingLoaded,
             readyResult: readyResult, scanned: scanned
+        )
+    }
+
+    nonisolated private static func relayMetrics(
+        target: CommandTarget,
+        status: RemoteDeviceOperations.HealthStatus
+    ) -> HealthCheckMetrics {
+        let network = minimuxer.network
+        return HealthCheckMetrics(
+            connectionMode: .remoteServer,
+            wifi: network.isWifiSatisfied,
+            wired: network.isWiredSatisfied,
+            usb: network.isUsbSatisfied,
+            bridge: network.isBridgeSatisfied,
+            utun: network.isUTunAvailable,
+            ipsec: network.isIKEv2IPSecAvailable,
+            tunnelIfaceIp: nil,
+            tunnelIfaceSubnetMask: nil,
+            tunnelPeerIp: nil,
+            overrideTunnelPeerIp: nil,
+            overrideTunnelPeerEffective: false,
+            remoteServerIp: target.serverAddress ?? "StikServer",
+            remotePeerIp: target.host,
+            remoteReachable: status.reachable,
+            protocolStr: status.protocolName,
+            pingSuccess: status.reachable,
+            ddi: status.ddiMounted,
+            pairingVerified: status.pairingVerified,
+            isRpPairing: status.protocolName == "Remote Pairing",
+            isPairingLoaded: status.pairingLoaded,
+            readyResult: .success(true),
+            scanned: network.activeInterfaces
+        )
+    }
+
+    nonisolated private static func failedMetrics(target: CommandTarget) -> HealthCheckMetrics {
+        let network = minimuxer.network
+        return HealthCheckMetrics(
+            connectionMode: target.kind == .local ? .localVPN : .remoteServer,
+            wifi: network.isWifiSatisfied,
+            wired: network.isWiredSatisfied,
+            usb: network.isUsbSatisfied,
+            bridge: network.isBridgeSatisfied,
+            utun: network.isUTunAvailable,
+            ipsec: network.isIKEv2IPSecAvailable,
+            tunnelIfaceIp: nil,
+            tunnelIfaceSubnetMask: nil,
+            tunnelPeerIp: nil,
+            overrideTunnelPeerIp: nil,
+            overrideTunnelPeerEffective: false,
+            remoteServerIp: target.serverAddress ?? target.host ?? "",
+            remotePeerIp: target.host,
+            remoteReachable: false,
+            protocolStr: target.kind == .local ? "Unknown" : "Remote Pairing",
+            pingSuccess: false,
+            ddi: false,
+            pairingVerified: false,
+            isRpPairing: target.kind != .local,
+            isPairingLoaded: target.pairingFileURL != nil || target.kind == .stikServer,
+            readyResult: .failure(.noConnection),
+            scanned: network.activeInterfaces
         )
     }
 
@@ -206,15 +282,13 @@ final class HealthCheckViewModel: ObservableObject {
         switch m.readyResult {
         case .success:
             let pingSat = m.pingSuccess
-            let isPairingLoaded = minimuxer.core.isPairingFileLoaded
-            let pairingSat: Bool? = m.pairingVerified ? true : (isPairingLoaded ? nil : false)
+            let pairingSat: Bool? = m.pairingVerified ? true : (m.isPairingLoaded ? nil : false)
             let ddiSat = m.ddi
             return (netSat, vpnSat, ipsecSat, pingSat, pairingSat, ddiSat)
 
         case .failure(let error):
             var pingSat: Bool? = m.pingSuccess
-            let isPairingLoaded = minimuxer.core.isPairingFileLoaded
-            var pairingSat: Bool? = m.pairingVerified ? true : (isPairingLoaded ? nil : false)
+            var pairingSat: Bool? = m.pairingVerified ? true : (m.isPairingLoaded ? nil : false)
             var ddiSat: Bool? = m.ddi
 
             switch error {
