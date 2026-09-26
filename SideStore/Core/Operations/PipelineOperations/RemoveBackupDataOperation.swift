@@ -21,6 +21,12 @@ final class RemoveBackupDataOperation: BasePipelineOperation<InstallAppOperation
             debugLog("[RemoveBackupDataOperation] execute() took: \(String(format: "%.3fs", elapsed))")
         }
         try await super.executePreconditionCheck(parentProgress: parentProgress)
+        // Remote backups remain available for recovery after a failed reinstall.
+        // Never delete this controller's local-device backup for a remote action.
+        if DeviceOperationScope.target.kind != .local {
+            self.setProgress(100)
+            return true
+        }
         self.setProgress(10)
         
         guard let installedApp = self.context.installedApp else {

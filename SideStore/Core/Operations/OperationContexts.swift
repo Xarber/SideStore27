@@ -265,6 +265,7 @@ final class SharedPipelineContext: @unchecked Sendable
 
 class InstallAppOperationContext: PipelineOperationContext
 {
+    var remoteBackupHelperInstalled = false
     let bundleIdentifier: String
     var customBundleIdentifier: String?
     var customInfoPlistByBundleID: [String: [String: any Sendable]] = [:]

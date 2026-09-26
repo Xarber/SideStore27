@@ -274,7 +274,7 @@ final class HealthCheckViewModel: ObservableObject {
     nonisolated private func computeStatuses(
         _ m: HealthCheckMetrics
     ) -> CoreRequirementStatuses {
-        let netSat = m.wifi
+        let netSat = m.wifi || m.pingSuccess
         let vpnSat = m.utun
         let isRp = m.protocolStr == "Remote Pairing"
         let ipsecSat = isRp ? nil : m.ipsec

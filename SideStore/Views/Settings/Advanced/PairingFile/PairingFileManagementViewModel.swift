@@ -15,6 +15,15 @@ import MinimuxerCommon
 
 @MainActor
 public final class PairingFileManagementViewModel: ObservableObject {
+    func exportPairingFile(at url: URL) {
+        guard let presenter = UIApplication.shared.topViewController() else { return }
+        #if os(tvOS)
+        TVWebFileTransferManager.shared.startExport(fileURL: url, title: "Export Pairing File", presentingVC: presenter)
+        #else
+        presenter.present(UIDocumentPickerViewController(forExporting: [url], asCopy: true), animated: true)
+        #endif
+    }
+
     public enum ActiveAlert: Identifiable {
         case deleteConfirmation(PairingProtocol)
         case deleteRemotePairing(String)

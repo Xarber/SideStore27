@@ -255,7 +255,6 @@ final class WirelessPairViewModel: ObservableObject {
     func openClientDialog() {
         debugLog("[WirelessPairViewModel] openClientDialog() opening client target pairing sheet")
         dialogMode = .client
-        selectedOption = .configuredFallback
         startDiscovery()
         isTargetDialogPresented = true
     }
@@ -337,8 +336,10 @@ final class WirelessPairViewModel: ObservableObject {
                     statusText = "Already Paired"
                     subStatusText = "\(target.name) is already paired. It is now the selected device for SideStore commands."
                 } else {
-                    statusText = "Pairing Required"
-                    subStatusText = "To pair \(target.name), use Start Pairing Server here and connect from the other device, or open that device's manual pairing screen. Its normal Nearby Devices endpoint cannot accept a new pairing."
+                    refreshInterfaces()
+                    if selectedServerInterfaceId == nil { selectDefaultServerInterface() }
+                    startPairing()
+                    subStatusText = "Open Developer settings on \(target.name) and connect to this SideStore pairing server."
                 }
             case .configuredFallback:
                 let fallback = fallbackConfigEndpoint

@@ -59,7 +59,7 @@ struct HealthCheckView: View {
             Section(header: Text("Core Requirements")) {
                 DependencyRow(
                     title: "Network Connectivity",
-                    subtitle: viewModel.networkSatisfied == nil ? "Unknown" : (viewModel.isWifiSatisfied ? "Wi-Fi Active" : "No Connection"),
+                    subtitle: viewModel.networkSatisfied == nil ? "Unknown" : (viewModel.isWifiSatisfied ? "Wi-Fi Active" : (viewModel.networkSatisfied == true ? "Device reachable" : "No Connection")),
                     isSatisfied: viewModel.networkSatisfied
                 )
                 

@@ -46,6 +46,13 @@ final class PerformBackupRestoreOperation: BasePipelineOperation<InstallAppOpera
         let (bundleID, fileURL, name, openAppURL) = context.performAndWait {
             (installedApp.bundleIdentifier, installedApp.fileURL, installedApp.name, installedApp.openAppURL)
         }
+        if DeviceOperationScope.target.kind != .local {
+            let remoteBundle = context.performAndWait { installedApp.resignedBundleIdentifier }
+            try await RemoteAppBackups.perform(action: action.rawValue, bundle: remoteBundle) { fraction in
+                self.setProgress(Int64(fraction * 100))
+            }
+            return fileURL
+        }
         
         self.debugLog("[BackupRestoreAppOperation] Ready to open app and observe backup. InstalledApp: \(bundleID)")
         try await self.openAppAndObserve(installedApp: installedApp, bundleIdentifier: bundleID, name: name, openAppURL: openAppURL)

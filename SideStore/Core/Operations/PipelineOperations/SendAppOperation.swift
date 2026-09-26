@@ -32,7 +32,7 @@ final class SendAppOperation: BasePipelineOperation<InstallAppOperationContext, 
         verboseLog("[SendAppOperation] AFC App Bundle `fileURL`: \(appURL.absoluteString)")
 
         do {
-            await CellularRefreshManager.shared.turnOffDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local { await CellularRefreshManager.shared.turnOffDataIfNeeded() }
             
             if (UserDefaults.standard.preferResignedIPA || DeviceOperationScope.requiresIPA), let ipaURL = self.context.ipaURL {
                 debugLog("[SendAppOperation] Sending IPA at \(ipaURL.path) via AFC...")
@@ -46,7 +46,7 @@ final class SendAppOperation: BasePipelineOperation<InstallAppOperationContext, 
             }
             self.setProgress(100)
         } catch {
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local { await CellularRefreshManager.shared.turnOnDataIfNeeded() }
 
             debugLog("[SendAppOperation] Failed to send app at \(self.context.ipaURL?.path ?? appURL.path): \(error)")
             throw error

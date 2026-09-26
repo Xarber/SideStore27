@@ -225,7 +225,7 @@ final class PipelineRunner: Sendable
         
         
         let operationsCount = operations.count
-        let isCellularRefreshGroup = (operationsCount >= 2 && CellularRefreshManager.shared.isCellularMode)
+        let isCellularRefreshGroup = (DeviceOperationScope.target.kind == .local && operationsCount >= 2 && CellularRefreshManager.shared.isCellularMode)
         group.isCellularRefreshGroup = isCellularRefreshGroup
         debugLog("[PipelineRunner] Configured pipeline for \(operationsCount) operation(s): isCellularRefreshGroup = \(isCellularRefreshGroup) (isCellularMode = \(CellularRefreshManager.shared.isCellularMode))")
 
@@ -272,6 +272,14 @@ final class PipelineRunner: Sendable
         }
         do {
             let result = try await self.performPipeline(for: operation, handler: handler, group: group, operationsCount: operationsCount)
+            if DeviceOperationScope.target.kind != .local {
+                switch operation {
+                case .activate, .install, .reinstall, .resign, .restore:
+                    let bundle = await group.dbContext.perform { result.resignedBundleIdentifier }
+                    RemoteAppBackups.setInactive(false, bundle: bundle, target: DeviceOperationScope.target)
+                default: break
+                }
+            }
             if operationsCount <= 1 {
                 progress.set(nil, for: operation)
                 debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(result.bundleIdentifier)")
@@ -310,9 +318,9 @@ final class PipelineRunner: Sendable
                 )
                 try await scheduleNotifOp.execute()
             }
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local { await CellularRefreshManager.shared.turnOnDataIfNeeded() }
         } catch {
-            await CellularRefreshManager.shared.turnOnDataIfNeeded()
+            if DeviceOperationScope.target.kind == .local { await CellularRefreshManager.shared.turnOnDataIfNeeded() }
             progress.set(nil, for: operation)
             
             let elapsed = CFAbsoluteTimeGetCurrent() - group.operationStartTime
@@ -341,7 +349,32 @@ final class PipelineRunner: Sendable
     
     private func performPipeline(for operation: AppOperation, handler: PipelineExecutionHandler, group: RefreshGroup, operationsCount: Int = 1) async throws -> InstalledApp
     {
-        let pipelineSteps = PipelineStepDefinition.steps(for: operation)
+        var pipelineSteps = PipelineStepDefinition.steps(for: operation)
+        if DeviceOperationScope.target.kind != .local {
+            let target = DeviceOperationScope.target
+            let udid = try await DeviceOperationSession.run(target: target) { try await RemoteDeviceOperations.fetchUDID() }
+            RemoteAppBackups.remember(udid: udid, target: target)
+            switch operation {
+            case .activate: pipelineSteps = PipelineStepDefinition.activate
+            case .deactivate: pipelineSteps = PipelineStepDefinition.deactivate
+            default: break
+            }
+            switch operation {
+            case .backup, .restore, .activate, .deactivate:
+                guard let app = operation.app as? InstalledApp,
+                      ALTApplication(fileURL: app.fileURL) != nil else {
+                    throw OperationError.invalidParameters("Import the original IPA before backing up or activating this remote app. No app was changed.")
+                }
+                switch operation {
+                case .activate, .restore:
+                    guard RemoteAppBackups.hasBackup(target: target, bundle: app.resignedBundleIdentifier) else {
+                        throw OperationError.invalidParameters("No complete backup exists for this app on the selected device. No app was changed.")
+                    }
+                default: break
+                }
+            default: break
+            }
+        }
         let context = InstallAppOperationContext(
             pipelineSteps: pipelineSteps,
             bundleIdentifier: operation.bundleIdentifier,
@@ -395,6 +428,7 @@ final class PipelineRunner: Sendable
         
         let permissionsMode = UserDefaults.standard.permissionCheckingDisabled ? .none : permissionReviewMode
         let operationProgress = progress.progress(for: operation)
+        do {
         return try await PipelineExecutor.shared.executePipeline(
             steps: pipelineSteps,
             context: context,
@@ -404,6 +438,24 @@ final class PipelineRunner: Sendable
             permissionsMode: permissionsMode,
             operationProgress: operationProgress
         )
+        } catch {
+            if context.remoteBackupHelperInstalled, let app = operation.app as? InstalledApp {
+                switch operation {
+                case .backup, .deactivate:
+                    // Replacement preserves the app container. Recover the original
+                    // executable if capture failed; never uninstall an unverified backup.
+                    do {
+                        _ = try await Task {
+                            try await self.performPipeline(for: .resign(app), handler: handler, group: group, operationsCount: 1)
+                        }.value
+                    } catch let recoveryError {
+                        throw OperationError.invalidParameters("Backup failed: \(error.localizedDescription). Reinstalling the original app also failed: \(recoveryError.localizedDescription). Its data and any completed backup were retained; use Resign on this same device to recover.")
+                    }
+                default: break
+                }
+            }
+            throw error
+        }
     }
 }
 

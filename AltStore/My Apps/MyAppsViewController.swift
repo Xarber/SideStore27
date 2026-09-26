@@ -208,7 +208,7 @@ class MyAppsViewController: UICollectionViewController
 
         CommandTargetManager.shared.startDiscovery()
         rebuildCommandTargetMenu()
-        updateRemoteAppsPresentation()
+        updateRemoteAppsPresentation(refreshExisting: true)
 
         if let pendingURL = self.pendingImportURL {
             self.pendingImportURL = nil
@@ -460,11 +460,11 @@ private extension MyAppsViewController {
         navigationController?.pushViewController(controller, animated: true)
     }
 
-    func updateRemoteAppsPresentation() {
+    func updateRemoteAppsPresentation(refreshExisting: Bool = false) {
         let target = CommandTargetManager.shared.selectedTarget
         navigationItem.title = target.kind == .local ? NSLocalizedString("My Apps", comment: "") : "\(target.name)'s Apps"
         if presentedTargetID == target.id {
-            reloadInstalledApps()
+            if refreshExisting { reloadInstalledApps() }
             return
         }
         presentedTargetID = target.id
@@ -517,36 +517,48 @@ private extension MyAppsViewController {
             defer { completion?() }
             do {
                 let apps = try await DeviceOperationSession.run(target: target) {
-                    try await RemoteDeviceOperations.listApps()
+                    if target.kind != .local {
+                        RemoteAppBackups.remember(udid: try await RemoteDeviceOperations.fetchUDID(), target: target)
+                    }
+                    return try await RemoteDeviceOperations.listApps()
                 }
                 guard !Task.isCancelled, let self,
                       CommandTargetManager.shared.selectedTarget.id == target.id else { return }
-                let installedIDs = Set(apps.map(\.bundleId))
+                let installedIDs = Set(apps.filter {
+                    $0.isBetaApp != true && $0.signerIdentity?.lowercased() != "apple iphone os application signing"
+                }.map(\.bundleId))
                 if target.kind == .local {
                     guard !installedIDs.isEmpty else {
                         throw RemoteDeviceError.invalidRelayResponse("device returned no installed apps")
                     }
                     // A remote install can have a managed record here too.
                     // Filter the live view instead of deleting that record.
-                    self.visibleLocalAppIDs = installedIDs
+                    let backedUpInactive = InstalledApp.all(in: DatabaseManager.shared.viewContext).filter { app in
+                        !app.isActive && !app.isDiscoveredRemoteApp &&
+                        FileManager.default.backupDirectoryURL(for: app).map { FileManager.default.fileExists(atPath: $0.path) } == true
+                    }.map(\.resignedBundleIdentifier)
+                    self.visibleLocalAppIDs = installedIDs.union(backedUpInactive)
                 } else {
-                    let profiles: [String: Date]
+                    let profileInventory: (expirations: [String: Date], betaIDs: Set<String>)
                     do {
-                        profiles = try await self.loadRemoteProfileExpirations(for: target)
+                        profileInventory = try await self.loadRemoteProfileExpirations(for: target)
                     } catch {
+                        guard !Task.isCancelled, !(error is CancellationError) else { return }
                         ToastView(error: error).show(in: self)
                         return
                     }
                     guard !Task.isCancelled,
                           CommandTargetManager.shared.selectedTarget.id == target.id else { return }
+                    let profiles = profileInventory.expirations
                     do {
-                        try self.recordDiscoveredRemoteApps(apps, profiles: profiles)
+                        try self.recordDiscoveredRemoteApps(apps.filter { !profileInventory.betaIDs.contains($0.bundleId) }, profiles: profiles)
                     } catch {
                         ToastView(error: error).show(in: self)
                         return
                     }
-                    self.visibleRemoteAppIDs = installedIDs
-                    self.remoteProfileExpirations = profiles
+                    let inactiveIDs = RemoteAppBackups.inactive(target: target)
+                    self.visibleRemoteAppIDs = installedIDs.subtracting(profileInventory.betaIDs).union(inactiveIDs)
+                    self.remoteProfileExpirations = profiles.filter { !inactiveIDs.contains($0.key) }
                     let versions = Dictionary(apps.map { ($0.bundleId, $0.version) }, uniquingKeysWith: { first, _ in first })
                     self.remoteUpdateAppIDs = Set(InstalledApp.all(in: DatabaseManager.shared.viewContext)
                         .filter { app in
@@ -557,7 +569,7 @@ private extension MyAppsViewController {
                 }
                 self.applyInstalledAppScope()
             } catch {
-                guard let self else { return }
+                guard !Task.isCancelled, !(error is CancellationError), let self else { return }
                 ToastView(error: error).show(in: self)
             }
         }
@@ -567,7 +579,7 @@ private extension MyAppsViewController {
         let context = DatabaseManager.shared.viewContext
         let knownIDs = Set(InstalledApp.all(in: context).map(\.resignedBundleIdentifier))
         var addedIDs = Set<String>()
-        for app in apps where (profiles[app.bundleId] != nil || Self.isDeveloperSigned(app.signerIdentity)) &&
+        for app in apps where app.isBetaApp != true && (profiles[app.bundleId] != nil || Self.isDeveloperSigned(app.signerIdentity)) &&
             !knownIDs.contains(app.bundleId) && addedIDs.insert(app.bundleId).inserted {
             // A profile or developer signing identifies sideloaded apps. Do not
             // import every User app; that would include App Store purchases.
@@ -624,7 +636,7 @@ private extension MyAppsViewController {
         present(alert, animated: true)
     }
 
-    private func loadRemoteProfileExpirations(for target: CommandTarget) async throws -> [String: Date] {
+    private func loadRemoteProfileExpirations(for target: CommandTarget) async throws -> (expirations: [String: Date], betaIDs: Set<String>) {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("SideStoreProfiles-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
@@ -639,14 +651,19 @@ private extension MyAppsViewController {
             at: URL(fileURLWithPath: path), includingPropertiesForKeys: nil
         )
         var expirations: [String: Date] = [:]
+        var betaIDs = Set<String>()
         for file in files where file.pathExtension.lowercased() == "mobileprovision" {
             guard let data = try? Data(contentsOf: file),
                   let profile = try? ALTProvisioningProfile(data: data) else { continue }
+            if profile.entitlements["beta-reports-active"] as? Bool == true {
+                betaIDs.insert(profile.bundleIdentifier)
+                continue
+            }
             if profile.expirationDate > (expirations[profile.bundleIdentifier] ?? .distantPast) {
                 expirations[profile.bundleIdentifier] = profile.expirationDate
             }
         }
-        return expirations
+        return (expirations, betaIDs)
     }
 
     private func hasRemoteUpdate(_ installedApp: InstalledApp, installedVersion: String) -> Bool {
@@ -1754,6 +1771,9 @@ private extension MyAppsViewController
     }
 
     private func promptToDeactivateApp(for installedApp: InstalledApp, completion: @escaping (Result<Void, Error>) -> Void) {
+        // The local three-app calculation must never deactivate a controller app
+        // to make room on a different device. The target reports its own limit.
+        guard CommandTargetManager.shared.selectedTarget.kind == .local else { return completion(.success(())) }
         guard let deactivationCandidates = AppManager.shared.appsToDeactivate(for: installedApp) else {
             return completion(.success(()))
         }
@@ -2692,7 +2712,18 @@ extension MyAppsViewController
             backupSubmenuActions.append(backupAction)
         }
                 
-        if let backupDirectoryURL = FileManager.default.backupDirectoryURL(for: installedApp)
+        if CommandTargetManager.shared.selectedTarget.kind != .local {
+            let target = CommandTargetManager.shared.selectedTarget
+            if RemoteAppBackups.hasBackup(target: target, bundle: installedApp.resignedBundleIdentifier) {
+                if isActiveOnTarget { backupSubmenuActions.append(restoreBackupAction) }
+                backupSubmenuActions.append(UIAction(title: NSLocalizedString("Export Backup", comment: ""), image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
+                    guard let self, let udid = RemoteAppBackups.device(for: target) else { return }
+                    let url = RemoteAppBackups.archive(udid: udid, bundle: installedApp.resignedBundleIdentifier)
+                    self.present(UIDocumentPickerViewController(forExporting: [url], asCopy: true), animated: true)
+                })
+            }
+        }
+        else if let backupDirectoryURL = FileManager.default.backupDirectoryURL(for: installedApp)
         {
             var backupExists = false
             var outError: NSError? = nil
@@ -2723,14 +2754,14 @@ extension MyAppsViewController
             }
         }
         
-        if isActiveOnTarget
+        if isActiveOnTarget && CommandTargetManager.shared.selectedTarget.kind == .local
         {
             // import backup into shared backups dir is allowed
             backupSubmenuActions.append(importBackupMenu)
         }
         
         // have an option to restore the n-1 backup
-        if FileManager.default.fileExists(atPath: getPreviousBackupURL(installedApp).path){
+        if CommandTargetManager.shared.selectedTarget.kind == .local && FileManager.default.fileExists(atPath: getPreviousBackupURL(installedApp).path){
             backupSubmenuActions.append(restorePreviousBackupAction)
         }
         

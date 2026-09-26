@@ -143,6 +143,9 @@ struct PairingFileManagementView: View {
                         .padding(16)
                         .contentShape(Rectangle())
                         .contextMenu {
+                            SwiftUI.Button { viewModel.exportPairingFile(at: file.url) } label: {
+                                Label("Export Device Pairing", systemImage: "square.and.arrow.up")
+                            }
                             SwiftUI.Button(role: .destructive) {
                                 viewModel.confirmDeleteRemotePairing(file)
                             } label: {
@@ -283,6 +286,9 @@ struct PairingFileManagementView: View {
                 }
                 .contextMenu {
                     if isValid {
+                        SwiftUI.Button { viewModel.exportPairingFile(at: fileURL) } label: {
+                            Label("Export Pairing File", systemImage: "square.and.arrow.up")
+                        }
                         if UserDefaults.standard.isMinimuxerBackendHotswapEnabled && proto != viewModel.activeProtocol {
                             SwiftUI.Button {
                                 Task {

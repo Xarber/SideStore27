@@ -184,6 +184,11 @@ class AppState: ObservableObject {
     }()
     
     init() {
+        Task {
+            self.currentOperation = .backup
+            _ = await RemoteBackup.runIfRequested()
+            self.currentOperation = nil
+        }
         if let error = ConsoleLog.bootCheckError {
             NSLog("[SideBackup] Boot Check ERROR: %@", error.localizedDescription)
             self.bootCheckError = error

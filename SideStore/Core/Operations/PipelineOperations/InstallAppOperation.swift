@@ -208,6 +208,7 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
         }
         
         self.setProgress(90)
+        if !isInstallingOnThisDevice { self.context.remoteBackupHelperInstalled = isSideBackup }
         
         // Phase 3: Post-install CoreData write — update refreshedDate
         if !isDifferentSideStore && !isSelfReinstall && !isSideBackup {

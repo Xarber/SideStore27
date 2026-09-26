@@ -24,6 +24,12 @@ final class MarkAppInactiveOperation: BasePipelineOperation<InstallAppOperationC
         }
         
         let backgroundContext = self.context.dbBackgroundContext
+        if DeviceOperationScope.target.kind != .local {
+            let bundle = await backgroundContext.perform { installedApp.resignedBundleIdentifier }
+            RemoteAppBackups.setInactive(true, bundle: bundle, target: DeviceOperationScope.target)
+            self.setProgress(100)
+            return installedApp
+        }
         
         let result = await backgroundContext.perform {
             let installedAppInContext = backgroundContext.object(with: installedApp.objectID) as! InstalledApp
