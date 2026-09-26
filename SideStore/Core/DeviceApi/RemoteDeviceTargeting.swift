@@ -192,6 +192,11 @@ final class CommandTargetManager: ObservableObject {
     @Published private(set) var relayTargets: [CommandTarget] = []
     @Published private(set) var isDiscovering = false
 
+    /// Merges physical devices that have different Bonjour and relay route IDs.
+    var availableTargets: [CommandTarget] {
+        Self.deduplicated([.local] + nearbyTargets + relayTargets)
+    }
+
     private var cancellables = Set<AnyCancellable>()
     private var resolutionTasks: [String: Task<Void, Never>] = [:]
     private lazy var nearbyBrowser: NearbyTargetBrowser = {
@@ -278,7 +283,7 @@ final class CommandTargetManager: ObservableObject {
             )
         }
         let oldTargets = nearbyTargets
-        nearbyTargets = targets
+        nearbyTargets = Self.deduplicated(targets)
         isDiscovering = nearbyBrowser.isSearching
         if let refreshed = targets.first(where: { Self.sameDevice($0, selectedTarget) }), refreshed != selectedTarget {
             select(refreshed)
@@ -286,6 +291,7 @@ final class CommandTargetManager: ObservableObject {
         if oldTargets != targets {
             NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
             updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+            reconcileSelectedTarget()
         }
     }
 
@@ -359,19 +365,22 @@ final class CommandTargetManager: ObservableObject {
                     port: resolved.port,
                     pairingFilePath: pairing?.url.path
                 )
-                if let index = self.nearbyTargets.firstIndex(where: { $0.id == target.id }) {
+                if let index = self.nearbyTargets.firstIndex(where: { Self.deduplicated([$0, target]).count == 1 }) {
                     guard self.nearbyTargets[index] != target else { return }
                     self.nearbyTargets[index] = target
+                    self.nearbyTargets = Self.deduplicated(self.nearbyTargets)
                     if self.selectedTarget.id == target.id {
                         self.select(target)
                     }
                     NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
                     self.updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+                    self.reconcileSelectedTarget()
                 } else {
                     self.nearbyTargets.append(target)
-                    self.nearbyTargets.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    self.nearbyTargets = Self.deduplicated(self.nearbyTargets)
                     NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
                     self.updateRelayTargets(from: StikServerDeviceConnection.shared.devices)
+                    self.reconcileSelectedTarget()
                 }
             }
         }
@@ -382,12 +391,21 @@ final class CommandTargetManager: ObservableObject {
         let directIdentifiers = Set(nearbyTargets.filter { $0.pairingFileURL != nil }.flatMap {
             [$0.pairingIdentifier, $0.advertisedServiceIdentifier, $0.host].compactMap { $0?.lowercased() }
         })
+        let pairedNearbyTargets = nearbyTargets.filter { $0.pairingFileURL != nil }
         var bestRoutes: [String: StikServerDevice] = [:]
         for device in devices {
             guard device.relayOriginID != SideStoreRelayAgentManager.shared.originID else { continue }
             let routeKey = device.pairingIdentifier?.lowercased() ?? device.id
             let identities = [device.id, device.pairingIdentifier, device.serviceIdentifier].compactMap { $0?.lowercased() }
-            guard directIdentifiers.isDisjoint(with: identities) else { continue }
+            let target = CommandTarget(
+                id: "stikserver|\(device.id)", name: device.name, kind: .stikServer,
+                deviceKind: device.kind, pairingIdentifier: device.pairingIdentifier,
+                advertisedServiceIdentifier: device.serviceIdentifier,
+                serverAddress: connection.serverAddress, serverToken: connection.accessToken,
+                relayDeviceID: device.id, relayCapabilities: Set(device.capabilities ?? [])
+            )
+            guard directIdentifiers.isDisjoint(with: identities),
+                  !pairedNearbyTargets.contains(where: { Self.deduplicated([$0, target]).count == 1 }) else { continue }
             if let current = bestRoutes[routeKey] {
                 let currentSupported = Self.supportsSideStore(current)
                 let candidateSupported = Self.supportsSideStore(device)
@@ -399,23 +417,25 @@ final class CommandTargetManager: ObservableObject {
             }
             bestRoutes[routeKey] = device
         }
-        relayTargets = bestRoutes.values.map { device in
+        relayTargets = Self.deduplicated(bestRoutes.values.map { device in
             CommandTarget(
                 id: "stikserver|\(device.id)",
                 name: device.name,
                 kind: .stikServer,
                 deviceKind: device.kind,
                 pairingIdentifier: device.pairingIdentifier,
+                advertisedServiceIdentifier: device.serviceIdentifier,
                 serverAddress: connection.serverAddress,
                 serverToken: connection.accessToken,
                 relayDeviceID: device.id,
                 relayCapabilities: Set(device.capabilities ?? [])
             )
-        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        })
         if let refreshed = relayTargets.first(where: { $0.id == selectedTarget.id }), refreshed != selectedTarget {
             select(refreshed)
         }
         NotificationCenter.default.post(name: .commandTargetsDidChange, object: nil)
+        reconcileSelectedTarget()
     }
 
     private static func supportsSideStore(_ device: StikServerDevice) -> Bool {
@@ -425,6 +445,69 @@ final class CommandTargetManager: ObservableObject {
 
     private static func routeCost(_ device: StikServerDevice) -> Int {
         device.mode == "direct" ? 0 : (device.routeHops ?? Int.max)
+    }
+
+    private static func deduplicated(_ targets: [CommandTarget]) -> [CommandTarget] {
+        func normalize(_ value: String?) -> String? {
+            guard let value else { return nil }
+            var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            for _ in 0..<3 {
+                normalized = normalized.replacingOccurrences(
+                    of: "^(sidestore-agent|nearby|stikserver|native)[|:]",
+                    with: "", options: .regularExpression
+                )
+            }
+            normalized = normalized.replacingOccurrences(of: "[^a-z0-9]", with: "", options: .regularExpression)
+            return normalized.isEmpty ? nil : normalized
+        }
+
+        func family(_ target: CommandTarget) -> String {
+            let value = "\(target.deviceKind ?? "") \(target.name)".lowercased()
+            if value.contains("ipad") { return "ipad" }
+            if value.contains("iphone") { return "iphone" }
+            if value.contains("appletv") || value.contains("apple tv") { return "tv" }
+            if value.contains("watch") { return "watch" }
+            return ""
+        }
+
+        func aliases(_ target: CommandTarget) -> Set<String> {
+            Set([target.id, target.pairingIdentifier, target.advertisedServiceIdentifier, target.relayDeviceID]
+                .compactMap(normalize))
+        }
+
+        func matches(_ lhs: CommandTarget, _ rhs: CommandTarget) -> Bool {
+            if lhs.id == rhs.id || !aliases(lhs).isDisjoint(with: aliases(rhs)) { return true }
+            let lhsName = normalize(lhs.name)
+            return lhsName != nil && lhsName == normalize(rhs.name) && family(lhs) != "" && family(lhs) == family(rhs)
+        }
+
+        func priority(_ target: CommandTarget) -> Int {
+            switch target.kind {
+            case .local: return 0
+            case .nearby: return target.pairingFileURL == nil ? 3 : 1
+            case .stikServer: return target.supportsSideStoreOperations ? 2 : 4
+            }
+        }
+
+        var unique: [CommandTarget] = []
+        for target in targets {
+            guard let index = unique.firstIndex(where: { matches($0, target) }) else {
+                unique.append(target)
+                continue
+            }
+            if priority(target) < priority(unique[index]) { unique[index] = target }
+        }
+        return unique.sorted {
+            if $0.kind == .local || $1.kind == .local { return $0.kind == .local && $1.kind != .local }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func reconcileSelectedTarget() {
+        guard selectedTarget.kind != .local,
+              let matching = availableTargets.first(where: { Self.deduplicated([$0, selectedTarget]).count == 1 }),
+              matching != selectedTarget else { return }
+        select(matching)
     }
 
     private static func resolve(_ service: DiscoveredService) async -> (host: String, port: UInt16)? {

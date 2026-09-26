@@ -387,11 +387,11 @@ private extension MyAppsViewController {
             guard let self else { return }
             let manager = CommandTargetManager.shared
             let isBusy = AppManager.shared.isActivelyManagingAnyApp || isManagingSigningAccounts
-            var targets = [CommandTarget.local] + manager.nearbyTargets + manager.relayTargets
+            var targets = manager.availableTargets
             if !targets.contains(where: { $0.id == manager.selectedTarget.id }) {
                 targets.append(manager.selectedTarget)
             }
-            let availableTargetIDs = Set(([CommandTarget.local] + manager.nearbyTargets + manager.relayTargets).map(\.id))
+            let availableTargetIDs = Set(manager.availableTargets.map(\.id))
             let targetActions = targets.map { target in
                 let subtitle: String?
                 let isUnavailable = !availableTargetIDs.contains(target.id)
