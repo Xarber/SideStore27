@@ -301,6 +301,10 @@ final class PipelineRunner: Sendable
             }
             
             group.set(.success(result), forAppWithBundleIdentifier: bundleID)
+            let completedTarget = DeviceOperationScope.target
+            await MainActor.run {
+                NotificationCenter.default.post(name: .installedAppsDidChange, object: completedTarget)
+            }
             debugLog("[AppManager] performOperation: Execution SUCCESS for app: \(operation.bundleIdentifier)")
             
             let elapsed = CFAbsoluteTimeGetCurrent() - group.operationStartTime

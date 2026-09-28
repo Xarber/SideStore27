@@ -282,7 +282,11 @@ final class BackupEngine: NSObject, Sendable {
             }
             
             // Replace previous backup with new backup.
-            _ = try FileManager.default.replaceItemAt(appBackupDirectory, withItemAt: temporaryAppBackupDirectory)
+            if FileManager.default.fileExists(atPath: appBackupDirectory.path) {
+                _ = try FileManager.default.replaceItemAt(appBackupDirectory, withItemAt: temporaryAppBackupDirectory)
+            } else {
+                try FileManager.default.moveItem(at: temporaryAppBackupDirectory, to: appBackupDirectory)
+            }
             tracker.complete()
             
             debugLog(logger, "[SideBackup] Replaced previous backup with new backup: \(temporaryAppBackupDirectory)")

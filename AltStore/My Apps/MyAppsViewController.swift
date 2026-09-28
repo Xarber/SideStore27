@@ -365,6 +365,11 @@ private extension MyAppsViewController {
             NotificationCenter.default.addObserver(forName: .commandTargetsDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.rebuildCommandTargetMenu()
             },
+            NotificationCenter.default.addObserver(forName: .installedAppsDidChange, object: nil, queue: .main) { [weak self] notification in
+                guard let self, let target = notification.object as? CommandTarget,
+                      target.id == CommandTargetManager.shared.selectedTarget.id else { return }
+                self.reloadInstalledApps()
+            },
             NotificationCenter.default.addObserver(forName: .commandTargetConnectionFailed, object: nil, queue: .main) { [weak self] notification in
                 guard let self, let error = notification.object as? Error, self.viewIfLoaded?.window != nil else { return }
                 let alert = UIAlertController(

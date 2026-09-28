@@ -55,15 +55,30 @@ enum RemoteAppBackups {
             let request = try JSONSerialization.data(withJSONObject: requestObject)
             _ = try await RemoteDeviceOperations.backupExchange(bundleID: bundle, action: "reset", file: "request.json", data: request)
             _ = try await RemoteDeviceOperations.backupExchange(bundleID: bundle, action: "launch")
+            let startupDeadline = Date().addingTimeInterval(45)
             let deadline = Date().addingTimeInterval(1800)
+            var acknowledged = false
+            var lastReadError: Error?
             var result: [String: Any]?
             while Date() < deadline {
                 try Task.checkCancellation()
                 // House Arrest may briefly disconnect while the helper launches.
-                if let data = try? await RemoteDeviceOperations.backupExchange(bundleID: bundle, action: "read"),
-                   let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any], status["id"] as? String == id {
+                do {
+                    let data = try await RemoteDeviceOperations.backupExchange(bundleID: bundle, action: "read")
+                    if let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any], status["id"] as? String == id {
+                    acknowledged = true
                     if status["state"] as? String == "failed" { throw OperationError.invalidParameters(status["message"] as? String ?? "Remote backup failed") }
                     if status["state"] as? String == "complete" { result = status; break }
+                    if let copied = status["copied"] as? NSNumber, let total = status["total"] as? NSNumber, total.doubleValue > 0 {
+                        let fraction = min(1, copied.doubleValue / total.doubleValue)
+                        progress(action == "backup" ? fraction * 0.65 : 0.8 + fraction * 0.2)
+                    }
+                    }
+                } catch let error as OperationError { throw error }
+                catch { lastReadError = error }
+                if !acknowledged && Date() > startupDeadline {
+                    let detail = lastReadError.map { " \($0.localizedDescription)" } ?? ""
+                    throw OperationError.invalidParameters("The backup helper did not accept the request on the selected device. Unlock that device and retry.\(detail)")
                 }
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -86,7 +101,7 @@ enum RemoteAppBackups {
                     hash.update(data: chunk)
                     try output.write(contentsOf: chunk)
                     offset += Int64(chunk.count)
-                    progress(Double(offset) / Double(size))
+                    progress(0.65 + Double(offset) / Double(size) * 0.35)
                 }
                 guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == expectedHash else {
                     throw OperationError.invalidParameters("Remote backup verification failed; app was not removed")

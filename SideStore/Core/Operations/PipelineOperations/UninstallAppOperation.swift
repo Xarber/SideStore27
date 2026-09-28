@@ -35,6 +35,11 @@ final class UninstallAppOperation: BasePipelineOperation<InstallAppOperationCont
         guard let resignedBundleIdentifier else {
             throw OperationError.invalidParameters("UninstallAppOperation: installedApp.managedObjectContext is nil")
         }
+        if DeviceOperationScope.target.kind != .local && self.context.remoteBackupHelperInstalled {
+            guard RemoteAppBackups.hasBackup(target: DeviceOperationScope.target, bundle: resignedBundleIdentifier) else {
+                throw OperationError.invalidParameters("No complete backup was saved for this remote app. It was not uninstalled.")
+            }
+        }
         
         // send uninstall payload to device
         do {

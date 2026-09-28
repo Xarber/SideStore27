@@ -185,9 +185,17 @@ class AppState: ObservableObject {
     
     init() {
         Task {
-            self.currentOperation = .backup
-            _ = await RemoteBackup.runIfRequested()
-            self.currentOperation = nil
+            // The helper may already be running when House Arrest delivers the
+            // request. Check while it is alive, as well as on its first launch.
+            while !Task.isCancelled {
+                if self.currentOperation == nil, let action = RemoteBackup.pendingAction {
+                    self.currentOperation = action == "backup" ? .backup : .restore
+                    self.progressText = action == "backup" ? "Backing up app data…" : "Restoring app data…"
+                    _ = await RemoteBackup.runIfRequested()
+                    self.currentOperation = nil
+                }
+                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { break }
+            }
         }
         if let error = ConsoleLog.bootCheckError {
             NSLog("[SideBackup] Boot Check ERROR: %@", error.localizedDescription)

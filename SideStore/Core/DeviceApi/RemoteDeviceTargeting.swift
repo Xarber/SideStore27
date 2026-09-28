@@ -181,6 +181,7 @@ extension Notification.Name {
     static let commandTargetsDidChange = Notification.Name("SideStore.commandTargetsDidChange")
     static let commandTargetConnectionFailed = Notification.Name("SideStore.commandTargetConnectionFailed")
     static let signingAccountDidChange = Notification.Name("SideStore.signingAccountDidChange")
+    static let installedAppsDidChange = Notification.Name("SideStore.installedAppsDidChange")
 }
 
 @MainActor

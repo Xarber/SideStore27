@@ -15,6 +15,27 @@ enum RemoteBackup {
     }
     static var exchange: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(".sidestore-remote") }
 
+    static var pendingAction: String? {
+        guard let data = try? Data(contentsOf: exchange.appendingPathComponent("request.json")),
+              let request = try? JSONDecoder().decode(Request.self, from: data),
+              UUID(uuidString: request.id) != nil, ["backup", "restore"].contains(request.action) else { return nil }
+        return request.action
+    }
+
+    private final class StatusProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var updated = Date.distantPast
+        let id: String
+        init(id: String) { self.id = id }
+        func update(copied: Int64, total: Int64) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard Date().timeIntervalSince(updated) >= 0.5 || copied == total else { return }
+            updated = Date()
+            try? RemoteBackup.writeStatus(["id": id, "state": "running", "copied": copied, "total": total])
+        }
+    }
+
     static func runIfRequested() async -> Bool {
         let fm = FileManager.default
         guard let data = try? Data(contentsOf: exchange.appendingPathComponent("request.json")),
@@ -23,6 +44,7 @@ enum RemoteBackup {
               ["backup", "restore"].contains(request.action) else { return false }
         do {
             try fm.removeItem(at: exchange.appendingPathComponent("request.json"))
+            try writeStatus(["id": request.id, "state": "running"])
             guard let group = Bundle.main.altstoreAppGroup,
                   let container = fm.containerURL(forSecurityApplicationGroupIdentifier: group),
                   let bundle = Bundle.main.bundleIdentifier else {
@@ -32,7 +54,11 @@ enum RemoteBackup {
             if request.action == "backup" {
                 // Never recursively include a previous transfer in the app backup.
                 try fm.removeItem(at: exchange)
-                try await BackupEngine.shared.performBackup(skipNonCopyable: false)
+                try writeStatus(["id": request.id, "state": "running"])
+                let status = StatusProgress(id: request.id)
+                try await BackupEngine.shared.performBackup(skipNonCopyable: false) { copied, total in
+                    status.update(copied: copied, total: total)
+                }
                 try fm.createDirectory(at: exchange, withIntermediateDirectories: true)
                 try pack(backup, to: exchange.appendingPathComponent("backup.bin"))
             } else {
@@ -52,7 +78,10 @@ enum RemoteBackup {
                 try fm.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if fm.fileExists(atPath: backup.path) { _ = try fm.replaceItemAt(backup, withItemAt: contents) }
                 else { try fm.moveItem(at: contents, to: backup) }
-                try await BackupEngine.shared.restoreBackup(skipNonCopyable: false)
+                let status = StatusProgress(id: request.id)
+                try await BackupEngine.shared.restoreBackup(skipNonCopyable: false) { copied, total in
+                    status.update(copied: copied, total: total)
+                }
             }
             var result: [String: Any] = ["id": request.id, "state": "complete"]
             if request.action == "backup" {
