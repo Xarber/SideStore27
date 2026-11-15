@@ -33,6 +33,14 @@ extension PillButton
 
 class PillButton: UIButton
 {
+    var showsSuccess = false {
+        didSet {
+            successImageView.isHidden = !showsSuccess
+            update()
+        }
+    }
+
+    private let successImageView = UIImageView(image: UIImage(systemName: "checkmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)))
     override var accessibilityValue: String? {
         get {
             guard self.progress != nil else { return super.accessibilityValue }
@@ -210,6 +218,16 @@ class PillButton: UIButton
         self.progressView.trackImage = UIImage()
         self.progressView.isUserInteractionEnabled = false
         self.addSubview(self.progressView)
+
+        successImageView.translatesAutoresizingMaskIntoConstraints = false
+        successImageView.tintColor = .white
+        successImageView.isHidden = true
+        successImageView.isUserInteractionEnabled = false
+        addSubview(successImageView)
+        NSLayoutConstraint.activate([
+            successImageView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            successImageView.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
         
         self.update()
     }
@@ -270,6 +288,7 @@ extension PillButton {
         self.borderColor = nil
         self.borderWidth = 0
         self.progress = nil
+        self.showsSuccess = false
         self.setTitle(nil, for: .normal)
         self.update()
     }
@@ -340,6 +359,8 @@ private extension PillButton
             self.layer.borderColor = nil
             self.layer.borderWidth = 0
         }
+        self.successImageView.isHidden = !self.showsSuccess || self.progress != nil || self.isIndicatingActivity
+        self.titleLabel?.isHidden = self.showsSuccess && self.progress == nil && !self.isIndicatingActivity
         
         // Update font after init because the original titleLabel is replaced.
         let size = self.fontSize ?? self.storyboardFontSize ?? 14

@@ -54,6 +54,8 @@ class MyAppsViewController: UICollectionViewController
     private var isRefreshingAllApps = false
     private var refreshGroup: RefreshGroup?
     private var sideloadingProgress: Progress?
+    private var successfulOperations: [String: Date] = [:]
+    private var refreshAllSuccessUntil: Date?
     private var dropDestinationIndexPath: IndexPath?
     private var isCheckingForUpdates = false
     private var didChangeActiveApps = false
@@ -951,6 +953,10 @@ private extension MyAppsViewController
             {
                 cell.bannerView.button.progress = nil
             }
+            cell.bannerView.button.showsSuccess = self.successfulOperations[installedApp.bundleIdentifier].map { $0 > Date() } ?? false
+            if cell.bannerView.button.showsSuccess {
+                cell.bannerView.button.accessibilityLabel = String(format: NSLocalizedString("Completed successfully for %@", comment: ""), installedApp.name)
+            }
         }
         dataSource.prefetchHandler = { (item, indexPath) in
             return try await item.loadIcon()
@@ -1029,6 +1035,10 @@ private extension MyAppsViewController
             else
             {
                 cell.bannerView.button.progress = nil
+            }
+            cell.bannerView.button.showsSuccess = self.successfulOperations[installedApp.bundleIdentifier].map { $0 > Date() } ?? false
+            if cell.bannerView.button.showsSuccess {
+                cell.bannerView.button.accessibilityLabel = String(format: NSLocalizedString("Completed successfully for %@", comment: ""), installedApp.name)
             }
         }
         dataSource.prefetchHandler = { (item, indexPath) in
@@ -1127,9 +1137,13 @@ private extension MyAppsViewController
     
     func refresh(_ installedApps: [InstalledApp], completionHandler: @escaping ([String : Result<InstalledApp, Error>]) -> Void)
     {
+        installedApps.forEach { successfulOperations.removeValue(forKey: $0.bundleIdentifier) }
         let group = AppManager.shared.refresh(installedApps, presentingViewController: self, group: self.isRefreshingAllApps ? self.refreshGroup : nil)
         group.completionHandler = { (results) in
             DispatchQueue.main.async {
+                for (bundleID, result) in results {
+                    if case .success = result { self.showOperationSuccess(for: bundleID) }
+                }
                 let failures = results.compactMapValues { (result) -> Error? in
                     switch result
                     {
@@ -1176,6 +1190,18 @@ private extension MyAppsViewController
         
         if self.isRefreshingAllApps
         {
+            self.reconfigureVisibleCells()
+        }
+    }
+
+    func showOperationSuccess(for bundleID: String)
+    {
+        let expiration = Date().addingTimeInterval(3)
+        successfulOperations[bundleID] = expiration
+        reconfigureVisibleCells()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.successfulOperations[bundleID] == expiration else { return }
+            self.successfulOperations.removeValue(forKey: bundleID)
             self.reconfigureVisibleCells()
         }
     }
@@ -1321,6 +1347,7 @@ private extension MyAppsViewController
             }
             
             self.isRefreshingAllApps = true
+            self.refreshAllSuccessUntil = nil
             if let activeAppsHeader = self.collectionView.supplementaryView(forElementKind: UICollectionView.elementKindSectionHeader, at: IndexPath(item: 0, section: Section.activeApps.rawValue)) as? InstalledAppsCollectionHeaderView {
                 activeAppsHeader.button.isIndicatingActivity = true
                 activeAppsHeader.button.accessibilityLabel = NSLocalizedString("Refreshing", comment: "")
@@ -1330,10 +1357,19 @@ private extension MyAppsViewController
             self.refresh(installedApps) { (result) in
                 DispatchQueue.main.async {
                     self.isRefreshingAllApps = false
+                    if !result.isEmpty && result.values.allSatisfy({ if case .success = $0 { return true }; return false }) {
+                        let expiration = Date().addingTimeInterval(3)
+                        self.refreshAllSuccessUntil = expiration
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                            guard let self, self.refreshAllSuccessUntil == expiration else { return }
+                            self.refreshAllSuccessUntil = nil
+                            self.configureRefreshAllButton()
+                        }
+                    }
                     if let activeAppsHeader = self.collectionView.supplementaryView(forElementKind: UICollectionView.elementKindSectionHeader, at: IndexPath(item: 0, section: Section.activeApps.rawValue)) as? InstalledAppsCollectionHeaderView {
                         activeAppsHeader.button.isIndicatingActivity = false
-                        activeAppsHeader.button.accessibilityLabel = nil
                     }
+                    self.configureRefreshAllButton()
                     self.reconfigureVisibleCells()
                 }
             }
@@ -1347,6 +1383,15 @@ private extension MyAppsViewController
             }
             #endif
         }
+    }
+
+    private func configureRefreshAllButton()
+    {
+        guard let header = collectionView.supplementaryView(forElementKind: UICollectionView.elementKindSectionHeader, at: IndexPath(item: 0, section: Section.activeApps.rawValue)) as? InstalledAppsCollectionHeaderView else { return }
+        let succeeded = refreshAllSuccessUntil.map { $0 > Date() } ?? false
+        header.button.setImage(succeeded ? UIImage(systemName: "checkmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)) : nil, for: .normal)
+        header.button.setTitle(succeeded ? nil : NSLocalizedString("Refresh All", comment: ""), for: .normal)
+        header.button.accessibilityLabel = succeeded ? NSLocalizedString("All apps refreshed successfully", comment: "") : nil
     }
     
     @IBAction func updateApp(_ sender: UIButton)
@@ -1376,6 +1421,7 @@ private extension MyAppsViewController
                     
                 case .success:
                     debugLog("Updated app: \(installedApp.bundleIdentifier)")
+                    self.showOperationSuccess(for: installedApp.bundleIdentifier)
                     // No need to reload, since the the update cell is gone now.
                 }
                 
@@ -1447,6 +1493,7 @@ private extension MyAppsViewController
                 
                 switch result {
                 case .success(let installedApp):
+                    self?.showOperationSuccess(for: installedApp.bundleIdentifier)
                     completion(.success(()))
                     installedApp.managedObjectContext?.perform {
                         debugLog("Successfully installed app: \(installedApp.bundleIdentifier)")
@@ -2498,7 +2545,10 @@ extension MyAppsViewController
                 else
                 {
                     headerView.button.isIndicatingActivity = false
-                    headerView.button.accessibilityLabel = nil
+                    let succeeded = self.refreshAllSuccessUntil.map { $0 > Date() } ?? false
+                    headerView.button.setImage(succeeded ? UIImage(systemName: "checkmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)) : nil, for: .normal)
+                    headerView.button.setTitle(succeeded ? nil : NSLocalizedString("Refresh All", comment: ""), for: .normal)
+                    headerView.button.accessibilityLabel = succeeded ? NSLocalizedString("All apps refreshed successfully", comment: "") : nil
                 }
             }
             
