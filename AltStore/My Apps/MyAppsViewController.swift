@@ -1719,6 +1719,7 @@ private extension MyAppsViewController
                             self?.reconfigureVisibleCells()
                         case .success(let app):
                             debugLog("Successfully reinstalled app from cache: \(app.name)")
+                    self?.showOperationSuccess(for: app.bundleIdentifier)
                             self?.reconfigureVisibleCells()
                         }
                     }
@@ -1754,6 +1755,7 @@ private extension MyAppsViewController
                             self?.reconfigureVisibleCells()
                         case .success(let app):
                             debugLog("Successfully reinstalled app from source: \(app.name)")
+                            self?.showOperationSuccess(for: app.bundleIdentifier)
                             self?.reconfigureVisibleCells()
                         }
                     }
